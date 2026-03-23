@@ -21,7 +21,7 @@ import {
   OrderType as ClobOrderType,
   Chain,
 } from '@polymarket/clob-client';
-import { Wallet, ethers } from 'ethers';
+import { Wallet } from 'ethers';
 import {
   POLYMARKET_PRIVATE_KEY,
   CLOB_HOST,
@@ -211,55 +211,6 @@ export class PolymarketClient {
 
   getWalletAddress(): string | null {
     return this.wallet?.address ?? null;
-  }
-
-  /**
-   * Fetch USDC.e and MATIC balances from Polygon, trying multiple RPC endpoints.
-   * Polymarket uses USDC.e (bridged USDC) on Polygon: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
-   */
-  async getWalletBalances(): Promise<{ usdc: number; matic: number }> {
-    if (!this.wallet) return { usdc: -1, matic: -1 };
-
-    const USDC_E = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC.e — used by Polymarket
-    const ABI = [
-      'function balanceOf(address owner) view returns (uint256)',
-      'function decimals() view returns (uint8)',
-    ];
-    const RPCS = [
-      'https://polygon-rpc.com',
-      'https://rpc.ankr.com/polygon',
-      'https://polygon.llamarpc.com',
-    ];
-
-    for (const rpcUrl of RPCS) {
-      try {
-        const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
-        const usdcContract = new ethers.Contract(USDC_E, ABI, provider);
-
-        const [rawBalance, decimals, rawMatic]: [ethers.BigNumber, number, ethers.BigNumber] =
-          await Promise.all([
-            usdcContract.balanceOf(this.wallet.address),
-            usdcContract.decimals(),
-            provider.getBalance(this.wallet.address),
-          ]);
-
-        const usdc = parseFloat(ethers.utils.formatUnits(rawBalance, decimals));
-        const matic = parseFloat(ethers.utils.formatEther(rawMatic));
-
-        logger.debug(`[PolymarketClient] Wallet balances via ${rpcUrl}: USDC=${usdc} MATIC=${matic}`);
-        return { usdc, matic };
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.debug(`[PolymarketClient] RPC ${rpcUrl} failed: ${msg}`);
-      }
-    }
-
-    return { usdc: -1, matic: -1 };
-  }
-
-  async getUsdcBalance(): Promise<number> {
-    const { usdc } = await this.getWalletBalances();
-    return usdc;
   }
 
   // ─── Market Discovery ──────────────────────────────────────────────────────

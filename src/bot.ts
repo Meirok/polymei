@@ -518,25 +518,44 @@ async function runStartupDiagnostic(): Promise<void> {
   lines.push(`- Binance ETH: ${fmtBinance('ETH', ethState?.currentPrice ?? 0)}`);
   lines.push(`- Binance SOL: ${fmtBinance('SOL', solState?.currentPrice ?? 0)}`);
 
-  // ── Wallet & balance ───────────────────────────────────────────────────────
+  // ── Wallet ─────────────────────────────────────────────────────────────────
   const walletAddr = polymarket.getWalletAddress();
-  const { usdc, matic } = await polymarket.getWalletBalances();
   const addrStr = walletAddr
     ? `${walletAddr.slice(0, 6)}...${walletAddr.slice(-4)}`
     : 'N/A';
-  const usdcStr = usdc >= 0 ? `$${usdc.toFixed(2)}` : '❌ Error';
-  const maticStr = matic >= 0 ? matic.toFixed(4) : '❌ Error';
-  const gasWarn = matic >= 0 && matic < 0.5 ? '\n  ⚠️ MATIC bajo — recargá gas' : '';
-  lines.push(
-    `💰 Wallet: ${addrStr}\n` +
-    `  - USDC: ${usdcStr}\n` +
-    `  - MATIC: ${maticStr} (gas)${gasWarn}`
-  );
+  lines.push(`💰 Wallet conectada: ${addrStr} ✅`);
 
   // ── Summary ────────────────────────────────────────────────────────────────
   lines.push(allMarketsOk ? '- Listo para operar ✅' : '- ⚠️ Revisar errores antes de operar');
 
   telegram.sendLog(lines.join('\n'));
+}
+
+// ─── Gamma API Debug ──────────────────────────────────────────────────────────
+
+async function debugGammaAPI(): Promise<void> {
+  const GAMMA_BASE = 'https://gamma-api.polymarket.com';
+  const urls = [
+    `${GAMMA_BASE}/events?active=true&closed=false&limit=10`,
+    `${GAMMA_BASE}/events?limit=5`,
+    `${GAMMA_BASE}/markets?active=true&limit=5`,
+    `${GAMMA_BASE}/events?slug=btc-updown-5m-1774268100`,
+  ];
+
+  console.log('\n========== DEBUG GAMMA API ==========');
+  for (const url of urls) {
+    try {
+      const res = await fetch(url);
+      const text = await res.text();
+      console.log(`\n=== ${url} ===`);
+      console.log(`Status: ${res.status}`);
+      console.log(`Response (first 1000 chars): ${text.slice(0, 1000)}`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.log(`\n=== ${url} === ERROR: ${msg}`);
+    }
+  }
+  console.log('\n========== END DEBUG GAMMA API ==========\n');
 }
 
 // ─── Startup ──────────────────────────────────────────────────────────────────
@@ -591,6 +610,10 @@ async function main(): Promise<void> {
   // Wait briefly for initial price data
   logger.info('[Bot] Waiting 3s for initial price data...');
   await sleep(3000);
+
+  // Debug Gamma API — log raw responses to console before regular fetch
+  logger.info('[Bot] Debugging Gamma API...');
+  await debugGammaAPI();
 
   // Run startup diagnostic and send full status to Telegram
   logger.info('[Bot] Running startup diagnostic...');
