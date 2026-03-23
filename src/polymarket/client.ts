@@ -89,6 +89,7 @@ interface GammaMarket {
   active: boolean;
   closed: boolean;
   endDateIso: string;
+  endDate?: string;
   tokens: Array<{
     token_id: string;
     outcome: string;
@@ -96,11 +97,13 @@ interface GammaMarket {
   }>;
 }
 
-// Gamma API event shape (wraps markets, returned by /events?slug=)
+// Gamma API event shape (wraps markets, returned by /events)
 interface GammaEvent {
   id: string;
   slug: string;
   title?: string;
+  endDate?: string;
+  endDateIso?: string;
   markets: GammaMarket[];
 }
 
@@ -142,12 +145,14 @@ export class PolymarketClient {
   // conditionId → market metadata cache (60s TTL)
   private marketCache = new Map<string, { data: GammaMarket; expiresAt: number }>();
 
-  // Timestamp-based market cache: SYMBOL → ActiveMarket
+  // SYMBOL → ActiveMarket (invalidated when < 10s to close)
   private activeMarketsCache = new Map<string, ActiveMarket>();
   // Last 5-min boundary timestamp seen during auto-refresh
   private lastKnownTimestamp = 0;
   // Auto-refresh interval handle
   private refreshTimer: NodeJS.Timeout | null = null;
+  // Symbols that have already had their first raw API response logged
+  private loggedFirstFetch = new Set<string>();
 
   // Optional callback for sending log messages to Telegram
   private logFn?: (msg: string) => void;
@@ -208,118 +213,262 @@ export class PolymarketClient {
     return this.wallet?.address ?? null;
   }
 
-  async getUsdcBalance(): Promise<number> {
-    if (!this.wallet) return -1;
-    try {
-      // USDC on Polygon Mainnet (native USDC)
-      const USDC_POLYGON = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359';
-      const provider = new ethers.providers.JsonRpcProvider('https://polygon-rpc.com');
-      const usdc = new ethers.Contract(
-        USDC_POLYGON,
-        ['function balanceOf(address owner) view returns (uint256)'],
-        provider
-      );
-      const raw: ethers.BigNumber = await usdc.balanceOf(this.wallet.address);
-      return parseFloat(ethers.utils.formatUnits(raw, 6));
-    } catch {
-      // Try USDC.e (bridged) as fallback
+  /**
+   * Fetch USDC.e and MATIC balances from Polygon, trying multiple RPC endpoints.
+   * Polymarket uses USDC.e (bridged USDC) on Polygon: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+   */
+  async getWalletBalances(): Promise<{ usdc: number; matic: number }> {
+    if (!this.wallet) return { usdc: -1, matic: -1 };
+
+    const USDC_E = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC.e — used by Polymarket
+    const ABI = [
+      'function balanceOf(address owner) view returns (uint256)',
+      'function decimals() view returns (uint8)',
+    ];
+    const RPCS = [
+      'https://polygon-rpc.com',
+      'https://rpc.ankr.com/polygon',
+      'https://polygon.llamarpc.com',
+    ];
+
+    for (const rpcUrl of RPCS) {
       try {
-        const USDCE_POLYGON = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
-        const provider = new ethers.providers.JsonRpcProvider('https://polygon-rpc.com');
-        const usdc = new ethers.Contract(
-          USDCE_POLYGON,
-          ['function balanceOf(address owner) view returns (uint256)'],
-          provider
-        );
-        const raw: ethers.BigNumber = await usdc.balanceOf(this.wallet.address);
-        return parseFloat(ethers.utils.formatUnits(raw, 6));
-      } catch {
-        return -1;
+        const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+        const usdcContract = new ethers.Contract(USDC_E, ABI, provider);
+
+        const [rawBalance, decimals, rawMatic]: [ethers.BigNumber, number, ethers.BigNumber] =
+          await Promise.all([
+            usdcContract.balanceOf(this.wallet.address),
+            usdcContract.decimals(),
+            provider.getBalance(this.wallet.address),
+          ]);
+
+        const usdc = parseFloat(ethers.utils.formatUnits(rawBalance, decimals));
+        const matic = parseFloat(ethers.utils.formatEther(rawMatic));
+
+        logger.debug(`[PolymarketClient] Wallet balances via ${rpcUrl}: USDC=${usdc} MATIC=${matic}`);
+        return { usdc, matic };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.debug(`[PolymarketClient] RPC ${rpcUrl} failed: ${msg}`);
       }
     }
+
+    return { usdc: -1, matic: -1 };
+  }
+
+  async getUsdcBalance(): Promise<number> {
+    const { usdc } = await this.getWalletBalances();
+    return usdc;
   }
 
   // ─── Market Discovery ──────────────────────────────────────────────────────
 
   /**
-   * Fetch a single market from Gamma /events?slug= using the known slug pattern.
+   * Discover the active 5-minute market for a symbol by querying the Gamma API.
+   *
+   * Uses 3 search strategies in order:
+   *   1. All active events (filter client-side by slug)
+   *   2. Slug prefix search
+   *   3. Tag-based search
+   *
+   * Results are cached until < 10s before close (approaching next window).
    */
-  private async fetchMarketBySlug(
-    symbol: string,
-    slug: string,
-    timestamp: number
+  async getActiveCryptoMarkets(symbol: string): Promise<ActiveMarket[]> {
+    const sym = symbol.toUpperCase();
+
+    // Return from cache if still valid (> 10s to close)
+    const cached = this.activeMarketsCache.get(sym);
+    if (cached) {
+      const secs = this.getSecondsUntilClose(cached);
+      if (secs >= 10) {
+        return [cached];
+      }
+      logger.debug(`[PolymarketClient] ${sym}: cache near expiry (${secs}s), refreshing`);
+    }
+
+    const symLower = sym.toLowerCase();
+    const slugPattern = `${symLower}-updown-5m`;
+
+    try {
+      const market = await this.searchForMarket(sym, symLower, slugPattern);
+      if (market) {
+        this.activeMarketsCache.set(sym, market);
+        logger.info(
+          `[PolymarketClient] ${sym}: found market ${market.slug} ` +
+          `(closes in ${this.getSecondsUntilClose(market)}s)`
+        );
+        return [market];
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error(`[PolymarketClient] ${sym}: searchForMarket error — ${msg}`);
+      this.logFn?.(`⚠️ [${sym}] Error buscando mercado: ${msg}`);
+    }
+
+    this.logFn?.(`❌ No se pudo obtener mercado para ${sym} (patrón slug: ${slugPattern}-*)`);
+    return [];
+  }
+
+  /**
+   * Try three Gamma API endpoints in order to find an active updown-5m market.
+   * Logs the raw response on the first fetch per symbol.
+   */
+  private async searchForMarket(
+    sym: string,
+    symLower: string,
+    slugPattern: string
   ): Promise<ActiveMarket | null> {
-    const url = `${GAMMA_API}/events?slug=${encodeURIComponent(slug)}`;
-    const resp = await fetch(url);
-    if (!resp.ok) {
-      logger.debug(`[PolymarketClient] ${symbol}: /events?slug=${slug} → HTTP ${resp.status}`);
+    const now = Math.floor(Date.now() / 1000);
+
+    // ── Approach 1: all active events, filter client-side ─────────────────────
+    try {
+      const url = `${GAMMA_API}/events?active=true&closed=false&limit=50&order=startDate&ascending=false`;
+      const resp = await fetch(url);
+      if (resp.ok) {
+        const raw = await resp.json();
+        // Log first 500 chars on first fetch so we can see the data structure
+        if (!this.loggedFirstFetch.has(sym)) {
+          this.loggedFirstFetch.add(sym);
+          console.log(
+            `[PolymarketClient] ${sym}: Raw Gamma API response (first 500 chars):`,
+            JSON.stringify(raw).slice(0, 500)
+          );
+        }
+        const events: GammaEvent[] = Array.isArray(raw) ? raw : [raw as GammaEvent];
+        const market = this.findMarketInEvents(events, sym, slugPattern, now);
+        if (market) return market;
+        logger.debug(`[PolymarketClient] ${sym}: approach 1 returned ${events.length} events, no slug match`);
+      } else {
+        logger.debug(`[PolymarketClient] ${sym}: approach 1 HTTP ${resp.status}`);
+      }
+    } catch (err) {
+      logger.debug(`[PolymarketClient] ${sym}: approach 1 error: ${err}`);
+    }
+
+    // ── Approach 2: slug prefix search ────────────────────────────────────────
+    try {
+      const url = `${GAMMA_API}/events?slug=${encodeURIComponent(slugPattern)}`;
+      const resp = await fetch(url);
+      if (resp.ok) {
+        const raw = await resp.json();
+        const events: GammaEvent[] = Array.isArray(raw) ? raw : [raw as GammaEvent];
+        const market = this.findMarketInEvents(events, sym, slugPattern, now);
+        if (market) return market;
+        logger.debug(`[PolymarketClient] ${sym}: approach 2 returned ${events.length} events, no match`);
+      } else {
+        logger.debug(`[PolymarketClient] ${sym}: approach 2 HTTP ${resp.status}`);
+      }
+    } catch (err) {
+      logger.debug(`[PolymarketClient] ${sym}: approach 2 error: ${err}`);
+    }
+
+    // ── Approach 3: tag-based search ──────────────────────────────────────────
+    try {
+      const url = `${GAMMA_API}/events?tag=crypto&active=true&limit=100`;
+      const resp = await fetch(url);
+      if (resp.ok) {
+        const raw = await resp.json();
+        const events: GammaEvent[] = Array.isArray(raw) ? raw : [raw as GammaEvent];
+        const market = this.findMarketInEvents(events, sym, slugPattern, now);
+        if (market) return market;
+        logger.debug(`[PolymarketClient] ${sym}: approach 3 returned ${events.length} events, no match`);
+      } else {
+        logger.debug(`[PolymarketClient] ${sym}: approach 3 HTTP ${resp.status}`);
+      }
+    } catch (err) {
+      logger.debug(`[PolymarketClient] ${sym}: approach 3 error: ${err}`);
+    }
+
+    return null;
+  }
+
+  /**
+   * Given a list of Gamma API events, find the matching updown-5m market.
+   * Filters by slug pattern, picks the one with earliest future endDate,
+   * and extracts Up/Down token IDs (falls back to Yes/No).
+   */
+  private findMarketInEvents(
+    events: GammaEvent[],
+    sym: string,
+    slugPattern: string,
+    now: number
+  ): ActiveMarket | null {
+    // Filter events whose slug contains the pattern
+    const matching = events.filter((e) => e.slug?.includes(slugPattern));
+    if (!matching.length) return null;
+
+    // Resolve end timestamp for each matching event
+    const withTimestamps = matching
+      .map((e) => {
+        const endDateStr =
+          e.endDate ??
+          e.endDateIso ??
+          e.markets?.[0]?.endDate ??
+          e.markets?.[0]?.endDateIso;
+        const endTs = endDateStr ? Math.floor(new Date(endDateStr).getTime() / 1000) : 0;
+        return { event: e, endTs };
+      })
+      .filter(({ endTs }) => endTs > now) // must still be in the future
+      .sort((a, b) => a.endTs - b.endTs); // earliest (soonest to close) = current window
+
+    if (!withTimestamps.length) {
+      logger.debug(`[PolymarketClient] ${sym}: all ${matching.length} matching events are expired`);
       return null;
     }
 
-    const raw = await resp.json();
-    const events: GammaEvent[] = Array.isArray(raw) ? raw : [raw as GammaEvent];
-    const event = events[0];
+    const { event, endTs } = withTimestamps[0];
+    const markets = event.markets ?? [];
 
-    if (!event?.markets?.length) {
-      logger.debug(`[PolymarketClient] ${symbol}: no markets in event for slug ${slug}`);
+    if (!markets.length) {
+      logger.debug(`[PolymarketClient] ${sym}: event ${event.slug} has no markets`);
       return null;
     }
 
-    const market = event.markets[0];
-    const yesToken = market.tokens?.find((t) => t.outcome.toLowerCase() === 'yes');
-    const noToken  = market.tokens?.find((t) => t.outcome.toLowerCase() === 'no');
+    // Extract Up/Down (or Yes/No) token IDs from the market tokens
+    let yesTokenId: string | undefined;
+    let noTokenId: string | undefined;
+    let yesPrice = 0.5;
+    let noPrice = 0.5;
+    let conditionId = '';
+    let question = '';
 
-    if (!yesToken || !noToken) {
-      logger.debug(`[PolymarketClient] ${symbol}: YES/NO tokens not found for slug ${slug}`);
+    for (const m of markets) {
+      conditionId = conditionId || m.conditionId;
+      question = question || m.question;
+
+      for (const t of m.tokens ?? []) {
+        const outcome = t.outcome.toLowerCase();
+        if ((outcome === 'up' || outcome === 'yes') && !yesTokenId) {
+          yesTokenId = t.token_id;
+          yesPrice = Number(t.price);
+        } else if ((outcome === 'down' || outcome === 'no') && !noTokenId) {
+          noTokenId = t.token_id;
+          noPrice = Number(t.price);
+        }
+      }
+
+      if (yesTokenId && noTokenId) break;
+    }
+
+    if (!yesTokenId || !noTokenId) {
+      logger.debug(
+        `[PolymarketClient] ${sym}: could not find Up/Down tokens in event ${event.slug}`
+      );
       return null;
     }
 
     return {
-      symbol,
-      slug,
-      timestamp,
-      conditionId: market.conditionId,
-      yesTokenId: yesToken.token_id,
-      noTokenId: noToken.token_id,
-      yesPrice: Number(yesToken.price),
-      noPrice: Number(noToken.price),
-      question: market.question ?? slug,
+      symbol: sym,
+      slug: event.slug,
+      timestamp: endTs,
+      conditionId: conditionId || event.id,
+      yesTokenId,
+      noTokenId,
+      yesPrice,
+      noPrice,
+      question: question || event.title || event.slug,
     };
-  }
-
-  /**
-   * Discover the active 5-minute market for a symbol using the timestamp-based
-   * slug: {symbol}-updown-5m-{unix_timestamp}
-   *
-   * Tries the current 5-min boundary first, then the next one.
-   * Updates the internal cache; use getActiveMarket() for fast cache reads.
-   */
-  async getActiveCryptoMarkets(symbol: string): Promise<ActiveMarket[]> {
-    const sym = symbol.toUpperCase();
-    const symLower = sym.toLowerCase();
-    const timestamps = [getCurrentMarketTimestamp(), getNextMarketTimestamp()];
-
-    for (const ts of timestamps) {
-      const slug = `${symLower}-updown-5m-${ts}`;
-      try {
-        const market = await this.fetchMarketBySlug(sym, slug, ts);
-        if (market) {
-          this.activeMarketsCache.set(sym, market);
-          logger.debug(`[PolymarketClient] ${sym}: cached market ${slug}`);
-          return [market];
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.debug(`[PolymarketClient] ${sym}: error fetching ${slug} — ${msg}`);
-        this.logFn?.(`⚠️ [${sym}] Error al obtener ${slug}: ${msg}`);
-      }
-    }
-
-    this.logFn?.(
-      `❌ No se pudo obtener mercado para ${sym}\n` +
-      `- Slugs probados: ${timestamps.map((ts) => `${symLower}-updown-5m-${ts}`).join(', ')}`
-    );
-    return [];
   }
 
   /**

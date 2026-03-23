@@ -520,12 +520,18 @@ async function runStartupDiagnostic(): Promise<void> {
 
   // ── Wallet & balance ───────────────────────────────────────────────────────
   const walletAddr = polymarket.getWalletAddress();
-  const balance = await polymarket.getUsdcBalance();
+  const { usdc, matic } = await polymarket.getWalletBalances();
   const addrStr = walletAddr
     ? `${walletAddr.slice(0, 6)}...${walletAddr.slice(-4)}`
     : 'N/A';
-  const balStr = balance >= 0 ? `$${balance.toFixed(2)}` : '❌ Error';
-  lines.push(`- Wallet: ${addrStr} | USDC: ${balStr}`);
+  const usdcStr = usdc >= 0 ? `$${usdc.toFixed(2)}` : '❌ Error';
+  const maticStr = matic >= 0 ? matic.toFixed(4) : '❌ Error';
+  const gasWarn = matic >= 0 && matic < 0.5 ? '\n  ⚠️ MATIC bajo — recargá gas' : '';
+  lines.push(
+    `💰 Wallet: ${addrStr}\n` +
+    `  - USDC: ${usdcStr}\n` +
+    `  - MATIC: ${maticStr} (gas)${gasWarn}`
+  );
 
   // ── Summary ────────────────────────────────────────────────────────────────
   lines.push(allMarketsOk ? '- Listo para operar ✅' : '- ⚠️ Revisar errores antes de operar');

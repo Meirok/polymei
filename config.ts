@@ -67,7 +67,7 @@ export const TELEGRAM_CHAT_ID = optionalEnv('TELEGRAM_CHAT_ID', '');
 
 // ─── Debug ───────────────────────────────────────────────────────────────────
 /** When true, send 30-second loop status messages to Telegram for diagnostics */
-export const DEBUG_MODE = optionalEnv('DEBUG_MODE', 'true') !== 'false';
+export const DEBUG_MODE = optionalEnv('DEBUG_MODE', 'false') !== 'false';
 
 // ─── Logging ─────────────────────────────────────────────────────────────────
 export const LOG_LEVEL = optionalEnv('LOG_LEVEL', 'info');
