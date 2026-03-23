@@ -173,19 +173,26 @@ export class PolymarketClient {
     this.signingAddress = process.env.POLY_ADDRESS ?? this.wallet.address;
     logger.info(`[PolymarketClient] Signing address: ${this.signingAddress}`);
 
-    // L2 credentials loaded directly from env
+    console.log('Using address:', process.env.POLY_ADDRESS);
+    console.log('Using API key:', process.env.POLY_API_KEY?.slice(0, 8) + '...');
+
+    // L2 credentials loaded directly from env — do NOT call deriveApiKey / createApiKey
     const creds = {
       key: process.env.POLY_API_KEY!,
       secret: process.env.POLY_SECRET!,
       passphrase: process.env.POLY_PASSPHRASE!,
     };
 
-    // L2 auth
-    this.clobClient = new ClobClient(CLOB_HOST, POLYGON_CHAIN_ID as Chain, this.wallet, {
-      key: creds.key,
-      secret: creds.secret,
-      passphrase: creds.passphrase,
-    });
+    // Pass POLY_ADDRESS as grantedAuth so ClobClient uses the correct account,
+    // not the address derived from the private key.
+    this.clobClient = new ClobClient(
+      CLOB_HOST,
+      POLYGON_CHAIN_ID as Chain,
+      this.wallet,
+      creds,
+      undefined,                      // sigType — use SDK default
+      process.env.POLY_ADDRESS,       // grantedAuth — the funded account address
+    );
 
     this.initialized = true;
     logger.info('[PolymarketClient] Initialized');
