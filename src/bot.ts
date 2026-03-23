@@ -19,6 +19,8 @@ import { RiskManager } from './risk/manager.js';
 import { TelegramNotifier } from './notifications/telegram.js';
 import { Dashboard } from './dashboard.js';
 import { logger } from './utils/logger.js';
+import { botState } from './state.js';
+import type { PriceState } from './feeds/binance.js';
 import {
   EVAL_INTERVAL_MS,
   DASHBOARD_INTERVAL_MS,
@@ -134,6 +136,9 @@ async function resolvePositionDryRun(
   const closed = risk.closePosition(position.id, exitPrice, won);
   if (!closed) return;
 
+  botState.pnlPeriod += closed.pnlUsd ?? 0;
+  botState.openPositions = risk.getSnapshot().openPositions;
+
   if (won) {
     telegram.notifyWin(closed);
   } else {
@@ -186,6 +191,9 @@ async function resolvePositionLive(position: ManagedPosition): Promise<void> {
   const closed = risk.closePosition(position.id, exitPrice, won);
   if (!closed) return;
 
+  botState.pnlPeriod += closed.pnlUsd ?? 0;
+  botState.openPositions = risk.getSnapshot().openPositions;
+
   if (won) {
     telegram.notifyWin(closed);
   } else {
@@ -223,12 +231,14 @@ async function processSignal(signal: TradeSignal): Promise<void> {
     `${signal.secondsRemaining.toFixed(0)}s left`
   );
 
+  botState.signalsDetected++;
   telegram.notifySignal(signal);
 
   // Risk check
   const { allowed, reason } = risk.canOpenPosition();
   if (!allowed) {
     logger.warn(`[Bot] Position blocked: ${reason}`);
+    botState.ordersRejected++;
     return;
   }
 
@@ -267,6 +277,8 @@ async function processSignal(signal: TradeSignal): Promise<void> {
     positionUsd
   );
 
+  botState.ordersPlaced++;
+  botState.openPositions = risk.getSnapshot().openPositions;
   telegram.notifyOrderPlaced(signal, position);
 
   logger.info(
@@ -299,6 +311,7 @@ async function main(): Promise<void> {
   setupTelegramCommands();
   telegram.initialize();
   telegram.notifyBotStarted();
+  telegram.sendFiveMinuteSummary();
 
   // Start Binance feed
   binance.connect();
@@ -307,6 +320,12 @@ async function main(): Promise<void> {
   });
   binance.on('error', (err: Error) => {
     logger.error('[Bot] Binance feed error', err);
+  });
+  binance.on('update', (ps: PriceState) => {
+    const sym = ps.symbol as keyof typeof botState.currentPrices;
+    if (sym in botState.currentPrices) {
+      botState.currentPrices[sym] = ps.currentPrice;
+    }
   });
 
   // Wait briefly for initial price data
