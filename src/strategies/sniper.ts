@@ -19,6 +19,7 @@ import {
   MIN_PRICE_CHANGE_PCT,
   MIN_CONFIDENCE,
   SYMBOLS,
+  DEBUG_MODE,
 } from '../../config.js';
 import { logger } from '../utils/logger.js';
 
@@ -133,6 +134,13 @@ export class Sniper {
   private lastSignalTime: Map<string, number> = new Map();
   private readonly SIGNAL_COOLDOWN_MS = 30_000; // 30s between signals for same symbol
 
+  // Debug loop: track when we last sent a 30s status message per symbol
+  private lastDebugLog: Map<string, number> = new Map();
+  private readonly DEBUG_LOG_INTERVAL_MS = 30_000;
+
+  // Cache the last known market found per symbol (for debug logging + bot.ts tracking)
+  private lastKnownMarket: Map<string, { question: string; expiryMs: number } | null> = new Map();
+
   // Optional callback for sending log messages to Telegram
   private logFn?: (msg: string) => void;
 
@@ -140,6 +148,11 @@ export class Sniper {
     private binance: BinanceFeed,
     private polymarket: PolymarketClient
   ) {}
+
+  /** Return the last market found for a symbol (used by bot.ts for market window tracking) */
+  getLastKnownMarket(symbol: string): { question: string; expiryMs: number } | null {
+    return this.lastKnownMarket.get(symbol) ?? null;
+  }
 
   /** Set a callback for sending diagnostic messages to Telegram */
   setLogFn(fn: (msg: string) => void): void {
@@ -166,6 +179,36 @@ export class Sniper {
       `momentum=${momentumEarly >= 0 ? '+' : ''}${momentumEarly.toFixed(4)} | ` +
       `precio=$${priceEarly.toLocaleString('en-US')}`
     );
+
+    // ── DEBUG MODE: send 30s loop status to Telegram ─────────────────────────
+    if (DEBUG_MODE && this.logFn) {
+      const lastLog = this.lastDebugLog.get(symbol) ?? 0;
+      if (Date.now() - lastLog >= this.DEBUG_LOG_INTERVAL_MS) {
+        this.lastDebugLog.set(symbol, Date.now());
+        const inWindow = secondsRemaining <= SNIPE_WINDOW_START && secondsRemaining >= SNIPE_WINDOW_END;
+        const moveOk = Math.abs(changeEarly) >= MIN_PRICE_CHANGE_PCT;
+        const cachedMarket = this.lastKnownMarket.get(symbol);
+        const marketFound = cachedMarket !== null && cachedMarket !== undefined;
+
+        // Estimate confidence for debug (without calling Polymarket API)
+        const direction = changeEarly > 0 ? 'BUY_YES' : 'BUY_NO';
+        const approxConf = moveOk
+          ? calculateConfidence(changeEarly, momentumEarly, 0.7, secondsRemaining, direction)
+          : 0;
+        const confOk = approxConf >= MIN_CONFIDENCE;
+
+        this.logFn(
+          `🔄 Loop activo [${symbol}]\n` +
+          `- ${symbol}: $${priceEarly > 0 ? priceEarly.toLocaleString('en-US') : 'N/A'} | ` +
+          `cambio vela: ${changeEarly >= 0 ? '+' : ''}${changeEarly.toFixed(2)}% | ` +
+          `segundos restantes: ${secondsRemaining.toFixed(0)}s\n` +
+          `- Mercado encontrado: ${marketFound ? `✅ "${cachedMarket!.question.slice(0, 40)}…"` : '❌'}\n` +
+          `- Condición tiempo: ${inWindow ? '✅' : '❌'} (necesita <${SNIPE_WINDOW_START}s, actual: ${secondsRemaining.toFixed(0)}s)\n` +
+          `- Condición movimiento: ${moveOk ? '✅' : '❌'} (necesita >${MIN_PRICE_CHANGE_PCT}%, actual: ${changeEarly >= 0 ? '+' : ''}${changeEarly.toFixed(2)}%)\n` +
+          `- Condición confianza: ${confOk ? `✅ (aprox ${approxConf})` : `❌ (aprox ${approxConf} < ${MIN_CONFIDENCE})`}`
+        );
+      }
+    }
 
     // ── 1. Time window check ─────────────────────────────────────────────────
     if (secondsRemaining > SNIPE_WINDOW_START || secondsRemaining < SNIPE_WINDOW_END) {
@@ -224,9 +267,16 @@ export class Sniper {
     );
     if (!market) {
       // "no market" is already logged to Telegram by PolymarketClient.findCurrentMarket
+      this.lastKnownMarket.set(symbol, null);
       logger.debug(`[Sniper:${symbol}] SKIP — sin mercado Polymarket`);
       return null;
     }
+
+    // Cache this market for debug logging and bot.ts market window tracking
+    this.lastKnownMarket.set(symbol, {
+      question: market.question,
+      expiryMs: new Date(market.endDateIso).getTime(),
+    });
 
     // ── 6. Get Polymarket odds ────────────────────────────────────────────────
     const odds = await this.polymarket.getPolymarketOdds(market);
