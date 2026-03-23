@@ -12,6 +12,7 @@
  */
 
 import 'dotenv/config';
+import readline from 'readline';
 import { BinanceFeed } from './feeds/binance.js';
 import { PolymarketClient } from './polymarket/client.js';
 import { Sniper, secondsUntilNext5MinBoundary } from './strategies/sniper.js';
@@ -27,6 +28,12 @@ import {
   DRY_RUN,
   DAILY_LOSS_LIMIT_USD,
   SYMBOLS,
+  MAX_POSITION_USD,
+  MAX_CONCURRENT_POSITIONS,
+  MIN_PRICE_CHANGE_PCT,
+  MIN_CONFIDENCE,
+  SNIPE_WINDOW_START,
+  SNIPE_WINDOW_END,
 } from '../config.js';
 import type { ManagedPosition } from './risk/manager.js';
 import type { TradeSignal } from './strategies/sniper.js';
@@ -288,6 +295,80 @@ async function processSignal(signal: TradeSignal): Promise<void> {
   );
 }
 
+// ─── Console Command Handler ──────────────────────────────────────────────────
+
+function setupConsoleCommands(): void {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: false,
+  });
+
+  rl.on('line', (input) => {
+    try {
+      const cmd = input.trim().toLowerCase();
+      switch (cmd) {
+        case 'pause':
+        case 'p':
+          botStatus = 'PAUSED';
+          logger.info('[Bot] Paused via console');
+          process.stdout.write('⏸ Bot pausado\n');
+          break;
+
+        case 'resume':
+        case 'r':
+          if (risk.isHalted()) risk.resume();
+          botStatus = 'ACTIVE';
+          logger.info('[Bot] Resumed via console');
+          process.stdout.write('▶️ Bot reanudado\n');
+          break;
+
+        case 'stop':
+        case 's':
+          process.stdout.write('🔴 Deteniendo...\n');
+          setTimeout(() => gracefulShutdown('console stop'), 1000);
+          break;
+
+        case 'status': {
+          const snapshot = risk.getSnapshot();
+          const positions = risk.getOpenPositions();
+          const prices = botState.currentPrices;
+          const posStr = positions.length === 0
+            ? 'none'
+            : positions.map((p) => `${p.symbol} ${p.side} $${p.costUsd.toFixed(2)}`).join(', ');
+          process.stdout.write(
+            `Status: ${botStatus} | Paused: ${botStatus === 'PAUSED'} | ` +
+            `Positions: ${posStr} | ` +
+            `P&L: ${snapshot.dailyPnl >= 0 ? '+' : ''}$${snapshot.dailyPnl.toFixed(2)} | ` +
+            `BTC: $${prices.BTC.toLocaleString()} ETH: $${prices.ETH.toFixed(1)} SOL: $${prices.SOL.toFixed(3)}\n`
+          );
+          break;
+        }
+
+        case 'config':
+          process.stdout.write(
+            `Config — DRY_RUN: ${DRY_RUN} | SYMBOLS: ${SYMBOLS.join(',')} | ` +
+            `MAX_POSITION_USD: $${MAX_POSITION_USD} | MAX_CONCURRENT: ${MAX_CONCURRENT_POSITIONS} | ` +
+            `DAILY_LOSS_LIMIT: $${DAILY_LOSS_LIMIT_USD} | MIN_CHANGE: ${MIN_PRICE_CHANGE_PCT}% | ` +
+            `MIN_CONFIDENCE: ${MIN_CONFIDENCE} | SNIPE_WINDOW: ${SNIPE_WINDOW_START}s–${SNIPE_WINDOW_END}s | ` +
+            `EVAL: ${EVAL_INTERVAL_MS}ms | DASHBOARD: ${DASHBOARD_INTERVAL_MS}ms\n`
+          );
+          break;
+
+        default:
+          if (cmd) {
+            process.stdout.write(
+              `Unknown command: "${cmd}". Available: pause (p), resume (r), stop (s), status, config\n`
+            );
+          }
+          break;
+      }
+    } catch (err) {
+      logger.error('[Bot] Console command error', err);
+    }
+  });
+}
+
 // ─── Startup ──────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -344,6 +425,9 @@ async function main(): Promise<void> {
 
   // Start dashboard
   dashboard.start(DASHBOARD_INTERVAL_MS);
+
+  // Set up console keyboard commands
+  setupConsoleCommands();
 
   // Daily summary at midnight
   scheduleDailySummary();

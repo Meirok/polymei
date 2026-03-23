@@ -164,7 +164,7 @@ export class Dashboard {
     lines.push('');
 
     // ── Footer ────────────────────────────────────────────────────────────────
-    lines.push(chalk.gray('  Commands: /pause  /resume  /stop  /status  /config'));
+    lines.push(chalk.gray('  Commands: pause (p)  resume (r)  stop (s)  status  config'));
     lines.push('');
 
     // Render
