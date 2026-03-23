@@ -1,3 +1,6 @@
+// Using native fetch from Node 18+
+// Do NOT import fetch from 'node-fetch'
+
 /**
  * src/polymarket/client.ts
  *
@@ -284,35 +287,54 @@ export class PolymarketClient {
 
   /**
    * Try candidate slugs derived from the current ET-aligned close timestamp.
-   * Candidates: [current, +1, +2, +3, -1] windows (5-min intervals).
+   * Candidates: [-1, 0, +1, +2] windows (5-min intervals).
    *
-   * Accepts a market if its endDate is not more than 30s in the past.
+   * Accepts a market if its endDate is not more than 60s in the past.
    */
   private async findCurrentMarketBySlug(sym: string): Promise<ActiveMarket | null> {
     const symLower = sym.toLowerCase();
-    const base = getCurrentMarketCloseTimestamp();
-    const candidates = [0, 1, 2, 3, -1].map((i) => base + i * 300);
-    const triedTimestamps: number[] = [];
+    const nowSec = Math.floor(Date.now() / 1000);
+    const etOffset = 4 * 3600;
+    const etNow = nowSec - etOffset;
+    const base = Math.ceil(etNow / 300) * 300 + etOffset;
+
+    const candidates = [-1, 0, 1, 2].map((i) => base + i * 300);
 
     for (const ts of candidates) {
       const slug = `${symLower}-updown-5m-${ts}`;
-      triedTimestamps.push(ts);
+      const url = `https://gamma-api.polymarket.com/events?slug=${slug}`;
+
+      console.log(`[${sym}] Trying: ${url}`);
 
       try {
-        const res = await fetch(
-          `${GAMMA_API}/events?slug=${encodeURIComponent(slug)}`,
-          { signal: AbortSignal.timeout(3000) }
-        );
-        const data: GammaSlugEvent[] = await res.json();
+        const response = await fetch(url);
+        const text = await response.text();
+
+        console.log(`[${sym}] Status: ${response.status}`);
+        console.log(`[${sym}] Raw response (200 chars): ${text.slice(0, 200)}`);
+
+        if (!text || text === '[]' || text === 'null') {
+          console.log(`[${sym}] Empty response, trying next...`);
+          continue;
+        }
+
+        const data = JSON.parse(text);
 
         if (!Array.isArray(data) || data.length === 0) {
-          logger.debug(`[PolymarketClient] ${sym}: slug ${slug} → empty`);
+          console.log(`[${sym}] No array or empty array`);
           continue;
         }
 
         const event = data[0];
+        console.log(`[${sym}] Event found: ${event.slug}, closed: ${event.closed}`);
+
         const market = event.markets?.[0];
-        if (!market) continue;
+        if (!market) {
+          console.log(`[${sym}] No markets array in event`);
+          continue;
+        }
+
+        console.log(`[${sym}] Market: acceptingOrders=${market.acceptingOrders}, endDate=${market.endDate}`);
 
         const clobTokenIds: string[] = JSON.parse(market.clobTokenIds || '[]');
         const outcomePrices: string[] = JSON.parse(market.outcomePrices || '["0.5","0.5"]');
@@ -320,50 +342,46 @@ export class PolymarketClient {
         const endDate = new Date(market.endDate);
         const secondsUntilClose = Math.floor((endDate.getTime() - Date.now()) / 1000);
 
-        if (secondsUntilClose < -30) {
-          logger.debug(`[PolymarketClient] ${sym}: slug ${slug} closed ${-secondsUntilClose}s ago, skipping`);
+        console.log(`[${sym}] secondsUntilClose: ${secondsUntilClose}`);
+
+        if (secondsUntilClose < -60) {
+          console.log(`[${sym}] Market already closed, trying next...`);
           continue;
         }
 
-        const yesTokenId = clobTokenIds[0];
-        const noTokenId = clobTokenIds[1];
-        if (!yesTokenId || !noTokenId) {
-          logger.debug(`[PolymarketClient] ${sym}: slug ${slug} missing token IDs`);
+        if (!clobTokenIds[0] || !clobTokenIds[1]) {
+          console.log(`[${sym}] Missing token IDs: ${market.clobTokenIds}`);
           continue;
         }
+
+        console.log(`[${sym}] ✅ Market found and valid!`);
 
         const yesPrice = parseFloat(outcomePrices[0]);
         const noPrice = parseFloat(outcomePrices[1]);
         const timestamp = Math.floor(endDate.getTime() / 1000);
-
-        console.log(
-          `✅ Found ${sym} market: ${slug} | closes in ${secondsUntilClose}s | acceptingOrders: ${market.acceptingOrders}`
-        );
 
         return {
           symbol: sym,
           slug,
           timestamp,
           conditionId: market.conditionId,
-          yesTokenId,
-          noTokenId,
+          yesTokenId: clobTokenIds[0],
+          noTokenId: clobTokenIds[1],
           yesPrice: isNaN(yesPrice) ? 0.5 : yesPrice,
           noPrice: isNaN(noPrice) ? 0.5 : noPrice,
           question: market.question ?? event.title ?? slug,
           acceptingOrders: market.acceptingOrders === true,
           endDate: market.endDate,
         };
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        console.log(`❌ Slug ${symLower}-updown-5m-${ts} failed: ${msg}`);
+      } catch (e: any) {
+        console.log(`[${sym}] Exception on ${slug}: ${e.message}`);
+        console.log(e.stack);
       }
     }
 
-    const triedStr = triedTimestamps.join(', ');
-    logger.warn(`[PolymarketClient] ${sym}: no valid market found — tried timestamps: ${triedStr}`);
-    this.logFn?.(
-      `❌ [${sym}] No encontrado — timestamps probados: ${triedStr}`
-    );
+    console.log(`[${sym}] ❌ All candidates failed`);
+    logger.warn(`[PolymarketClient] ${sym}: no valid market found — tried timestamps: ${candidates.join(', ')}`);
+    this.logFn?.(`❌ [${sym}] No encontrado — timestamps probados: ${candidates.join(', ')}`);
     return null;
   }
 

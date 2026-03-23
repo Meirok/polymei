@@ -538,6 +538,22 @@ async function runStartupDiagnostic(): Promise<void> {
 
 // ─── Gamma API Debug ──────────────────────────────────────────────────────────
 
+async function testFetchDirect(): Promise<void> {
+  console.log('=== DIRECT FETCH TEST ===');
+  const url = 'https://gamma-api.polymarket.com/events?slug=btc-updown-5m-1774293000';
+  try {
+    const res = await fetch(url);
+    const text = await res.text();
+    console.log('Direct fetch status:', res.status);
+    console.log('Direct fetch result:', text.slice(0, 300));
+    console.log('=== END TEST ===');
+  } catch (e: any) {
+    console.log('Direct fetch FAILED:', e.message);
+  }
+}
+// Call immediately
+testFetchDirect();
+
 async function debugGammaAPI(): Promise<void> {
   const GAMMA_BASE = 'https://gamma-api.polymarket.com';
   const urls = [
