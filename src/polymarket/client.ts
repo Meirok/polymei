@@ -548,6 +548,41 @@ export class PolymarketClient {
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
 
+  private async deriveOrCreateApiKey() {
+    try {
+      const derived = await this.clobClient!.deriveApiKey()
+      console.log('[deriveApiKey] raw response:', JSON.stringify(derived))
+
+      // The response might use different field names - check all possibilities:
+      const key = (derived as any).key || (derived as any).apiKey || (derived as any).api_key
+      const secret = (derived as any).secret || (derived as any).apiSecret || (derived as any).api_secret || (derived as any).secretKey
+      const passphrase = (derived as any).passphrase || (derived as any).apiPassphrase || (derived as any).api_passphrase
+
+      console.log('[deriveApiKey] extracted:', {
+        key: key?.slice(0, 8),
+        secret: secret ? 'SET' : 'UNDEFINED',
+        passphrase: passphrase ? 'SET' : 'UNDEFINED',
+      })
+
+      if (!secret || !passphrase) {
+        // Try createApiKey instead
+        console.log('[deriveApiKey] secret missing, trying createApiKey...')
+        const created = await this.clobClient!.createApiKey()
+        console.log('[createApiKey] raw response:', JSON.stringify(created))
+        return {
+          key: (created as any).key || (created as any).apiKey,
+          secret: (created as any).secret || (created as any).apiSecret || (created as any).secretKey,
+          passphrase: (created as any).passphrase || (created as any).apiPassphrase,
+        }
+      }
+
+      return { key, secret, passphrase }
+    } catch (e: any) {
+      console.log('[deriveApiKey] error:', e.message)
+      throw e
+    }
+  }
+
   private async getTickSize(tokenId: string): Promise<string> {
     if (this.tickSizeCache.has(tokenId)) return this.tickSizeCache.get(tokenId)!;
     const ts = await this.clobClient!.getTickSize(tokenId);
