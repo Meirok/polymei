@@ -80,7 +80,29 @@ export interface Position {
   status: 'OPEN' | 'FILLED' | 'CANCELLED';
 }
 
-// Gamma API market shape (minimal fields we need)
+// Inner market within a Gamma series event (real API structure)
+interface GammaSeriesMarket {
+  conditionId: string;
+  clobTokenIds: string;   // JSON string: ["tokenId1", "tokenId2"]
+  outcomePrices: string;  // JSON string: ["0.51", "0.49"]
+  outcomes: string;       // JSON string: ["Up", "Down"]
+  acceptingOrders: boolean;
+  endDate: string;        // ISO string
+  question?: string;
+}
+
+// Gamma API event shape (series endpoint, real API structure)
+interface GammaSeriesEvent {
+  id: string;
+  slug: string;
+  title?: string;
+  closed: boolean;
+  startTime: string;
+  markets: GammaSeriesMarket[];
+  series?: Array<{ slug: string }>;
+}
+
+// Legacy GammaMarket shape — used by findCurrentMarket() for backward compat
 interface GammaMarket {
   id: string;
   conditionId: string;
@@ -97,27 +119,19 @@ interface GammaMarket {
   }>;
 }
 
-// Gamma API event shape (wraps markets, returned by /events)
-interface GammaEvent {
-  id: string;
-  slug: string;
-  title?: string;
-  endDate?: string;
-  endDateIso?: string;
-  markets: GammaMarket[];
-}
-
 /** Structured market object returned by timestamp-based discovery. */
 export interface ActiveMarket {
   symbol: string;
   slug: string;
-  timestamp: number;   // Unix seconds — market close time
+  timestamp: number;        // Unix seconds — market close time
   conditionId: string;
-  yesTokenId: string;
-  noTokenId: string;
-  yesPrice: number;
-  noPrice: number;
+  yesTokenId: string;       // "Up" outcome token
+  noTokenId: string;        // "Down" outcome token
+  yesPrice: number;         // Up price (0-1)
+  noPrice: number;          // Down price (0-1)
   question: string;
+  acceptingOrders: boolean; // Only trade when true
+  endDate: string;          // ISO string
 }
 
 // ─── Timestamp Helpers ────────────────────────────────────────────────────────
@@ -239,15 +253,14 @@ export class PolymarketClient {
     }
 
     const symLower = sym.toLowerCase();
-    const slugPattern = `${symLower}-updown-5m`;
 
     try {
-      const market = await this.searchForMarket(sym, symLower, slugPattern);
+      const market = await this.searchForMarket(sym, symLower, '');
       if (market) {
         this.activeMarketsCache.set(sym, market);
         logger.info(
           `[PolymarketClient] ${sym}: found market ${market.slug} ` +
-          `(closes in ${this.getSecondsUntilClose(market)}s)`
+          `(closes in ${this.getSecondsUntilClose(market)}s, acceptingOrders=${market.acceptingOrders})`
         );
         return [market];
       }
@@ -257,169 +270,177 @@ export class PolymarketClient {
       this.logFn?.(`⚠️ [${sym}] Error buscando mercado: ${msg}`);
     }
 
-    this.logFn?.(`❌ No se pudo obtener mercado para ${sym} (patrón slug: ${slugPattern}-*)`);
+    this.logFn?.(`❌ No se pudo obtener mercado para ${sym} (seriesSlug: ${this.getSeriesSlug(sym)})`);
     return [];
   }
 
   /**
-   * Try three Gamma API endpoints in order to find an active updown-5m market.
+   * Returns the Polymarket series slug for a given symbol.
+   * e.g. BTC → "btc-up-or-down-5m"
+   */
+  private getSeriesSlug(symbol: string): string {
+    const map: Record<string, string> = {
+      BTC: 'btc-up-or-down-5m',
+      ETH: 'eth-up-or-down-5m',
+      SOL: 'sol-up-or-down-5m',
+    };
+    return map[symbol.toUpperCase()] ?? `${symbol.toLowerCase()}-up-or-down-5m`;
+  }
+
+  /**
+   * Fetch active markets for a symbol using the series slug endpoint.
    * Logs the raw response on the first fetch per symbol.
+   *
+   * Primary:  GET /events?seriesSlug=btc-up-or-down-5m&active=true&closed=false&limit=5&order=startDate&ascending=true
+   * Fallback: GET /events?series=btc-up-or-down-5m&limit=10
    */
   private async searchForMarket(
     sym: string,
-    symLower: string,
-    slugPattern: string
+    _symLower: string,
+    _slugPattern: string
   ): Promise<ActiveMarket | null> {
-    const now = Math.floor(Date.now() / 1000);
+    const seriesSlug = this.getSeriesSlug(sym);
+    const nowMs = Date.now();
 
-    // ── Approach 1: all active events, filter client-side ─────────────────────
+    // ── Primary: seriesSlug query ──────────────────────────────────────────────
     try {
-      const url = `${GAMMA_API}/events?active=true&closed=false&limit=50&order=startDate&ascending=false`;
+      const url =
+        `${GAMMA_API}/events?seriesSlug=${encodeURIComponent(seriesSlug)}` +
+        `&active=true&closed=false&limit=5&order=startDate&ascending=true`;
       const resp = await fetch(url);
       if (resp.ok) {
-        const raw = await resp.json();
-        // Log first 500 chars on first fetch so we can see the data structure
+        const data = await resp.json();
+        // Log raw response on first fetch so we can verify the correct fields
         if (!this.loggedFirstFetch.has(sym)) {
           this.loggedFirstFetch.add(sym);
-          console.log(
-            `[PolymarketClient] ${sym}: Raw Gamma API response (first 500 chars):`,
-            JSON.stringify(raw).slice(0, 500)
-          );
+          console.log('Gamma seriesSlug response:', JSON.stringify(data).slice(0, 500));
         }
-        const events: GammaEvent[] = Array.isArray(raw) ? raw : [raw as GammaEvent];
-        const market = this.findMarketInEvents(events, sym, slugPattern, now);
-        if (market) return market;
-        logger.debug(`[PolymarketClient] ${sym}: approach 1 returned ${events.length} events, no slug match`);
+        const events: GammaSeriesEvent[] = Array.isArray(data) ? data : [data as GammaSeriesEvent];
+        if (events.length > 0) {
+          const market = this.pickBestEvent(events, sym, nowMs);
+          if (market) return market;
+          logger.debug(`[PolymarketClient] ${sym}: seriesSlug returned ${events.length} events, none valid`);
+        } else {
+          logger.debug(`[PolymarketClient] ${sym}: seriesSlug returned empty array`);
+        }
       } else {
-        logger.debug(`[PolymarketClient] ${sym}: approach 1 HTTP ${resp.status}`);
+        logger.debug(`[PolymarketClient] ${sym}: seriesSlug HTTP ${resp.status}`);
       }
     } catch (err) {
-      logger.debug(`[PolymarketClient] ${sym}: approach 1 error: ${err}`);
+      logger.debug(`[PolymarketClient] ${sym}: seriesSlug error: ${err}`);
     }
 
-    // ── Approach 2: slug prefix search ────────────────────────────────────────
+    // ── Fallback: series query ─────────────────────────────────────────────────
     try {
-      const url = `${GAMMA_API}/events?slug=${encodeURIComponent(slugPattern)}`;
+      const url = `${GAMMA_API}/events?series=${encodeURIComponent(seriesSlug)}&limit=10`;
       const resp = await fetch(url);
       if (resp.ok) {
-        const raw = await resp.json();
-        const events: GammaEvent[] = Array.isArray(raw) ? raw : [raw as GammaEvent];
-        const market = this.findMarketInEvents(events, sym, slugPattern, now);
+        const data = await resp.json();
+        const events: GammaSeriesEvent[] = Array.isArray(data) ? data : [data as GammaSeriesEvent];
+        const market = this.pickBestEvent(events, sym, nowMs);
         if (market) return market;
-        logger.debug(`[PolymarketClient] ${sym}: approach 2 returned ${events.length} events, no match`);
+        logger.debug(`[PolymarketClient] ${sym}: series fallback returned ${events.length} events, none valid`);
       } else {
-        logger.debug(`[PolymarketClient] ${sym}: approach 2 HTTP ${resp.status}`);
+        logger.debug(`[PolymarketClient] ${sym}: series fallback HTTP ${resp.status}`);
       }
     } catch (err) {
-      logger.debug(`[PolymarketClient] ${sym}: approach 2 error: ${err}`);
-    }
-
-    // ── Approach 3: tag-based search ──────────────────────────────────────────
-    try {
-      const url = `${GAMMA_API}/events?tag=crypto&active=true&limit=100`;
-      const resp = await fetch(url);
-      if (resp.ok) {
-        const raw = await resp.json();
-        const events: GammaEvent[] = Array.isArray(raw) ? raw : [raw as GammaEvent];
-        const market = this.findMarketInEvents(events, sym, slugPattern, now);
-        if (market) return market;
-        logger.debug(`[PolymarketClient] ${sym}: approach 3 returned ${events.length} events, no match`);
-      } else {
-        logger.debug(`[PolymarketClient] ${sym}: approach 3 HTTP ${resp.status}`);
-      }
-    } catch (err) {
-      logger.debug(`[PolymarketClient] ${sym}: approach 3 error: ${err}`);
+      logger.debug(`[PolymarketClient] ${sym}: series fallback error: ${err}`);
     }
 
     return null;
   }
 
   /**
-   * Given a list of Gamma API events, find the matching updown-5m market.
-   * Filters by slug pattern, picks the one with earliest future endDate,
-   * and extracts Up/Down token IDs (falls back to Yes/No).
+   * From a list of series events, pick the best one:
+   * - Prefer the event whose trading window contains now (startTime <= now <= endDate)
+   * - Fallback to the soonest upcoming event (smallest startTime in future)
+   * - market.acceptingOrders must be true (logged as warning if not)
    */
-  private findMarketInEvents(
-    events: GammaEvent[],
+  private pickBestEvent(
+    events: GammaSeriesEvent[],
     sym: string,
-    slugPattern: string,
-    now: number
+    nowMs: number
   ): ActiveMarket | null {
-    // Filter events whose slug contains the pattern
-    const matching = events.filter((e) => e.slug?.includes(slugPattern));
-    if (!matching.length) return null;
-
-    // Resolve end timestamp for each matching event
-    const withTimestamps = matching
+    // Filter: not closed, has markets, endDate in the future
+    const candidates = events
+      .filter((e) => !e.closed && e.markets?.length > 0)
       .map((e) => {
-        const endDateStr =
-          e.endDate ??
-          e.endDateIso ??
-          e.markets?.[0]?.endDate ??
-          e.markets?.[0]?.endDateIso;
-        const endTs = endDateStr ? Math.floor(new Date(endDateStr).getTime() / 1000) : 0;
-        return { event: e, endTs };
+        const m = e.markets[0];
+        const startMs = e.startTime ? new Date(e.startTime).getTime() : 0;
+        const endMs = m.endDate ? new Date(m.endDate).getTime() : 0;
+        return { event: e, market: m, startMs, endMs };
       })
-      .filter(({ endTs }) => endTs > now) // must still be in the future
-      .sort((a, b) => a.endTs - b.endTs); // earliest (soonest to close) = current window
+      .filter(({ endMs }) => endMs > nowMs)
+      .sort((a, b) => a.endMs - b.endMs); // earliest close first
 
-    if (!withTimestamps.length) {
-      logger.debug(`[PolymarketClient] ${sym}: all ${matching.length} matching events are expired`);
+    if (!candidates.length) {
+      logger.debug(`[PolymarketClient] ${sym}: no non-expired candidates`);
       return null;
     }
 
-    const { event, endTs } = withTimestamps[0];
-    const markets = event.markets ?? [];
+    // Prefer current trading window; fallback to soonest upcoming
+    const current = candidates.find(
+      ({ startMs, endMs }) => startMs <= nowMs && nowMs <= endMs
+    );
+    const picked = current ?? candidates[0];
 
-    if (!markets.length) {
-      logger.debug(`[PolymarketClient] ${sym}: event ${event.slug} has no markets`);
-      return null;
+    if (!picked.market.acceptingOrders) {
+      logger.debug(`[PolymarketClient] ${sym}: best event not accepting orders yet (still valid to cache)`);
     }
 
-    // Extract Up/Down (or Yes/No) token IDs from the market tokens
-    let yesTokenId: string | undefined;
-    let noTokenId: string | undefined;
-    let yesPrice = 0.5;
-    let noPrice = 0.5;
-    let conditionId = '';
-    let question = '';
+    return this.parseSeriesMarket(picked.event, picked.market, sym);
+  }
 
-    for (const m of markets) {
-      conditionId = conditionId || m.conditionId;
-      question = question || m.question;
+  /**
+   * Parse a GammaSeriesEvent + GammaSeriesMarket into an ActiveMarket.
+   * Parses JSON string fields (clobTokenIds, outcomePrices, outcomes).
+   */
+  private parseSeriesMarket(
+    event: GammaSeriesEvent,
+    market: GammaSeriesMarket,
+    sym: string
+  ): ActiveMarket | null {
+    try {
+      const clobTokenIds: string[] = JSON.parse(market.clobTokenIds);
+      const outcomePrices: string[] = JSON.parse(market.outcomePrices);
+      const outcomes: string[] = JSON.parse(market.outcomes);
 
-      for (const t of m.tokens ?? []) {
-        const outcome = t.outcome.toLowerCase();
-        if ((outcome === 'up' || outcome === 'yes') && !yesTokenId) {
-          yesTokenId = t.token_id;
-          yesPrice = Number(t.price);
-        } else if ((outcome === 'down' || outcome === 'no') && !noTokenId) {
-          noTokenId = t.token_id;
-          noPrice = Number(t.price);
-        }
+      // Find Up and Down indices (default: Up=0, Down=1)
+      const upIdx = outcomes.findIndex((o) => o.toLowerCase() === 'up');
+      const downIdx = outcomes.findIndex((o) => o.toLowerCase() === 'down');
+      const effectiveUpIdx = upIdx >= 0 ? upIdx : 0;
+      const effectiveDownIdx = downIdx >= 0 ? downIdx : 1;
+
+      const upTokenId = clobTokenIds[effectiveUpIdx];
+      const downTokenId = clobTokenIds[effectiveDownIdx];
+      const upPrice = parseFloat(outcomePrices[effectiveUpIdx]);
+      const downPrice = parseFloat(outcomePrices[effectiveDownIdx]);
+
+      const endDateMs = new Date(market.endDate).getTime();
+      const timestamp = Math.floor(endDateMs / 1000);
+
+      if (!upTokenId || !downTokenId) {
+        logger.debug(`[PolymarketClient] ${sym}: missing token IDs in event ${event.slug}`);
+        return null;
       }
 
-      if (yesTokenId && noTokenId) break;
-    }
-
-    if (!yesTokenId || !noTokenId) {
-      logger.debug(
-        `[PolymarketClient] ${sym}: could not find Up/Down tokens in event ${event.slug}`
-      );
+      return {
+        symbol: sym,
+        slug: event.slug,
+        timestamp,
+        conditionId: market.conditionId,
+        yesTokenId: upTokenId,
+        noTokenId: downTokenId,
+        yesPrice: isNaN(upPrice) ? 0.5 : upPrice,
+        noPrice: isNaN(downPrice) ? 0.5 : downPrice,
+        question: market.question ?? event.title ?? event.slug,
+        acceptingOrders: market.acceptingOrders,
+        endDate: market.endDate,
+      };
+    } catch (err) {
+      logger.debug(`[PolymarketClient] ${sym}: parseSeriesMarket error: ${err}`);
       return null;
     }
-
-    return {
-      symbol: sym,
-      slug: event.slug,
-      timestamp: endTs,
-      conditionId: conditionId || event.id,
-      yesTokenId,
-      noTokenId,
-      yesPrice,
-      noPrice,
-      question: question || event.title || event.slug,
-    };
   }
 
   /**
