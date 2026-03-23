@@ -12,7 +12,7 @@
  */
 
 import type { BinanceFeed } from '../feeds/binance.js';
-import type { PolymarketClient, ActiveMarket } from '../polymarket/client.js';
+import type { PolymarketClient, Market } from '../polymarket/client.js';
 import {
   SNIPE_WINDOW_START,
   SNIPE_WINDOW_END,
@@ -139,7 +139,7 @@ export class Sniper {
   private readonly DEBUG_LOG_INTERVAL_MS = 30_000;
 
   // Cache the last known market found per symbol (for debug logging + bot.ts tracking)
-  private lastKnownMarket: Map<string, ActiveMarket | null> = new Map();
+  private lastKnownMarket: Map<string, Market | null> = new Map();
 
   // Optional callback for sending log messages to Telegram
   private logFn?: (msg: string) => void;
@@ -153,7 +153,7 @@ export class Sniper {
   getLastKnownMarket(symbol: string): { question: string; expiryMs: number } | null {
     const m = this.lastKnownMarket.get(symbol) ?? null;
     if (!m) return null;
-    return { question: m.question, expiryMs: m.timestamp * 1000 };
+    return { question: m.slug, expiryMs: new Date(m.endDate).getTime() };
   }
 
   /** Set a callback for sending diagnostic messages to Telegram */
@@ -278,7 +278,7 @@ export class Sniper {
 
     this.logFn?.(
       `🏪 [${symbol}] Mercado: ${market.slug}\n` +
-      `- YES: ${market.yesPrice.toFixed(3)} | NO: ${market.noPrice.toFixed(3)}\n` +
+      `- UP: ${market.upPrice.toFixed(3)} | DOWN: ${market.downPrice.toFixed(3)}\n` +
       `- Vence en: ${secondsRemaining.toFixed(0)}s`
     );
 
@@ -288,37 +288,37 @@ export class Sniper {
     let polyPrice: number;
 
     if (isLong) {
-      if (market.yesPrice >= MAX_ENTRY_PRICE) {
+      if (market.upPrice >= MAX_ENTRY_PRICE) {
         logger.debug(
-          `[Sniper:${symbol}] SKIP — YES ya priceado en ${market.yesPrice.toFixed(3)} ≥ ${MAX_ENTRY_PRICE}`
+          `[Sniper:${symbol}] SKIP — UP ya priceado en ${market.upPrice.toFixed(3)} ≥ ${MAX_ENTRY_PRICE}`
         );
         this.logFn?.(
           `🔍 [${symbol}] Señal evaluada\n` +
           `- Cambio vela: ${change >= 0 ? '+' : ''}${change.toFixed(3)}%\n` +
           `- Segundos restantes: ${secondsRemaining.toFixed(0)}s\n` +
-          `- Odds YES: ${market.yesPrice.toFixed(3)}\n` +
-          `- Resultado: ❌ Rechazada (YES ya priceado ≥ ${MAX_ENTRY_PRICE})`
+          `- Odds UP: ${market.upPrice.toFixed(3)}\n` +
+          `- Resultado: ❌ Rechazada (UP ya priceado ≥ ${MAX_ENTRY_PRICE})`
         );
         return null;
       }
       action = 'BUY_YES';
-      polyPrice = market.yesPrice;
+      polyPrice = market.upPrice;
     } else {
-      if (market.noPrice >= MAX_ENTRY_PRICE) {
+      if (market.downPrice >= MAX_ENTRY_PRICE) {
         logger.debug(
-          `[Sniper:${symbol}] SKIP — NO ya priceado en ${market.noPrice.toFixed(3)} ≥ ${MAX_ENTRY_PRICE}`
+          `[Sniper:${symbol}] SKIP — DOWN ya priceado en ${market.downPrice.toFixed(3)} ≥ ${MAX_ENTRY_PRICE}`
         );
         this.logFn?.(
           `🔍 [${symbol}] Señal evaluada\n` +
           `- Cambio vela: ${change >= 0 ? '+' : ''}${change.toFixed(3)}%\n` +
           `- Segundos restantes: ${secondsRemaining.toFixed(0)}s\n` +
-          `- Odds NO: ${market.noPrice.toFixed(3)}\n` +
-          `- Resultado: ❌ Rechazada (NO ya priceado ≥ ${MAX_ENTRY_PRICE})`
+          `- Odds DOWN: ${market.downPrice.toFixed(3)}\n` +
+          `- Resultado: ❌ Rechazada (DOWN ya priceado ≥ ${MAX_ENTRY_PRICE})`
         );
         return null;
       }
       action = 'BUY_NO';
-      polyPrice = market.noPrice;
+      polyPrice = market.downPrice;
     }
 
     // ── 7. Confidence scoring ─────────────────────────────────────────────────
@@ -366,12 +366,12 @@ export class Sniper {
       confidence,
       binanceChange: change,
       momentum,
-      polyYes: market.yesPrice,
-      polyNo: market.noPrice,
-      yesTokenId: market.yesTokenId,
-      noTokenId: market.noTokenId,
+      polyYes: market.upPrice,
+      polyNo: market.downPrice,
+      yesTokenId: market.upTokenId,
+      noTokenId: market.downTokenId,
       marketId: market.conditionId,
-      question: market.question,
+      question: market.slug,
       secondsRemaining,
       currentPrice: priceState.currentPrice,
     };
