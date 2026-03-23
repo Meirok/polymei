@@ -34,9 +34,27 @@ import {
   MIN_CONFIDENCE,
   SNIPE_WINDOW_START,
   SNIPE_WINDOW_END,
+  GAMMA_API,
 } from '../config.js';
 import type { ManagedPosition } from './risk/manager.js';
 import type { TradeSignal } from './strategies/sniper.js';
+
+// ─── Market Window Tracking ───────────────────────────────────────────────────
+
+interface MarketWindow {
+  symbol: string;
+  question: string;
+  expiryMs: number;
+  betPlaced: boolean;
+  positionId: string | null;
+  side?: 'YES' | 'NO';
+  betAmount?: number;
+  betOdds?: number;
+  noTradeReasons: string[];
+  closeSummarySent: boolean;
+}
+
+const marketWindows = new Map<string, MarketWindow>();
 
 // ─── Bot State ────────────────────────────────────────────────────────────────
 
@@ -228,6 +246,80 @@ async function evaluationTick(): Promise<void> {
   for (const signal of signals) {
     await processSignal(signal);
   }
+
+  // ── Update market windows from sniper's cached market data ──────────────
+  for (const sym of SYMBOLS) {
+    const known = sniper.getLastKnownMarket(sym);
+    if (known) {
+      const existing = marketWindows.get(sym);
+      // Register new window or update if market changed
+      if (!existing || existing.expiryMs !== known.expiryMs) {
+        marketWindows.set(sym, {
+          symbol: sym,
+          question: known.question,
+          expiryMs: known.expiryMs,
+          betPlaced: false,
+          positionId: null,
+          noTradeReasons: [],
+          closeSummarySent: false,
+        });
+      }
+    }
+  }
+
+  // ── Check for market expirations and send close summaries ───────────────
+  const now = Date.now();
+  for (const [sym, win] of marketWindows.entries()) {
+    if (win.closeSummarySent || now < win.expiryMs) continue;
+
+    const priceState = binance.getState(sym);
+    const priceAtClose = priceState?.currentPrice ?? 0;
+    const snapshot = risk.getSnapshot();
+
+    // Determine result if a bet was placed
+    let result: 'win' | 'loss' | 'pending' | undefined;
+    let pnlFromBet: number | undefined;
+
+    if (win.betPlaced && win.positionId) {
+      // Check if position is already closed (WIN/LOSS) or still open
+      const openPos = risk.getOpenPositions().find((p) => p.id === win.positionId);
+      if (openPos) {
+        result = 'pending';
+      } else {
+        // Closed — we can't easily recover the P&L here without adding a new
+        // method to RiskManager, so mark as pending and let win/loss notify handle it
+        result = 'pending';
+      }
+    }
+
+    const expiryDate = new Date(win.expiryMs);
+    const marketTime =
+      `${expiryDate.getUTCHours().toString().padStart(2, '0')}:` +
+      `${expiryDate.getUTCMinutes().toString().padStart(2, '0')} UTC`;
+
+    const noTradeReason = win.noTradeReasons.length > 0
+      ? win.noTradeReasons[win.noTradeReasons.length - 1] // most recent reason
+      : undefined;
+
+    telegram.notifyMarketClose({
+      symbol: sym,
+      marketTime,
+      question: win.question,
+      betPlaced: win.betPlaced,
+      betSide: win.side,
+      betAmount: win.betAmount,
+      betOdds: win.betOdds,
+      result,
+      pnlFromBet,
+      noTradeReason,
+      priceAtClose,
+      dailyPnl: snapshot.dailyPnl,
+    });
+
+    win.closeSummarySent = true;
+    // Clean up old windows (keep for a minute in case of late resolution)
+    setTimeout(() => marketWindows.delete(sym), 60_000);
+  }
 }
 
 async function processSignal(signal: TradeSignal): Promise<void> {
@@ -246,12 +338,16 @@ async function processSignal(signal: TradeSignal): Promise<void> {
   if (!allowed) {
     logger.warn(`[Bot] Position blocked: ${reason}`);
     botState.ordersRejected++;
+    const win = marketWindows.get(signal.symbol);
+    if (win) win.noTradeReasons.push(`riesgo bloqueado: ${reason}`);
     return;
   }
 
   // Already have a position in this market?
   if (risk.getOpenPositionByMarket(signal.marketId)) {
     logger.debug(`[Bot] Already have position in ${signal.marketId}`);
+    const win = marketWindows.get(signal.symbol);
+    if (win) win.noTradeReasons.push('ya hay posición en este mercado');
     return;
   }
 
@@ -272,6 +368,8 @@ async function processSignal(signal: TradeSignal): Promise<void> {
 
   if (!result.success) {
     logger.error(`[Bot] Order failed: ${result.errorMsg}`);
+    const win = marketWindows.get(signal.symbol);
+    if (win) win.noTradeReasons.push(`orden fallida: ${result.errorMsg}`);
     return;
   }
 
@@ -287,6 +385,16 @@ async function processSignal(signal: TradeSignal): Promise<void> {
   botState.ordersPlaced++;
   botState.openPositions = risk.getSnapshot().openPositions;
   telegram.notifyOrderPlaced(signal, position);
+
+  // Mark market window as bet placed
+  const win = marketWindows.get(signal.symbol);
+  if (win) {
+    win.betPlaced = true;
+    win.positionId = position.id;
+    win.side = position.side;
+    win.betAmount = positionUsd;
+    win.betOdds = result.price;
+  }
 
   logger.info(
     `[Bot] Order placed: ${signal.symbol} ${signal.action} ` +
@@ -369,6 +477,103 @@ function setupConsoleCommands(): void {
   });
 }
 
+// ─── Startup Diagnostic ───────────────────────────────────────────────────────
+
+async function runStartupDiagnostic(): Promise<void> {
+  const lines: string[] = ['🔧 DIAGNÓSTICO DE INICIO'];
+
+  // ── Binance WS ─────────────────────────────────────────────────────────────
+  const btcState = binance.getState('BTC');
+  const ethState = binance.getState('ETH');
+  const solState = binance.getState('SOL');
+  const binanceOk = !!(btcState?.currentPrice || ethState?.currentPrice || solState?.currentPrice);
+
+  lines.push(`- Binance WS: ${binanceOk ? '✅' : '❌'} conectado`);
+
+  const fmtPrice = (sym: string, price: number): string => {
+    if (price <= 0) return `$N/A`;
+    if (sym === 'BTC') return `$${Math.round(price).toLocaleString('en-US')}`;
+    if (sym === 'ETH') return `$${Math.round(price).toLocaleString('en-US')}`;
+    return `$${price.toFixed(2)}`;
+  };
+
+  lines.push(`- BTC precio actual: ${fmtPrice('BTC', btcState?.currentPrice ?? 0)}`);
+  lines.push(`- ETH precio actual: ${fmtPrice('ETH', ethState?.currentPrice ?? 0)}`);
+  lines.push(`- SOL precio actual: ${fmtPrice('SOL', solState?.currentPrice ?? 0)}`);
+
+  // ── Polymarket API ─────────────────────────────────────────────────────────
+  let polyOk = false;
+  try {
+    const resp = await fetch(`${GAMMA_API}/markets?active=true&limit=1`);
+    polyOk = resp.ok;
+    lines.push(`- Polymarket API: ${polyOk ? '✅' : `❌ HTTP ${resp.status}`} conectado`);
+    if (!polyOk) {
+      lines.push(`  Detalle: ${resp.status} ${resp.statusText}`);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    lines.push(`- Polymarket API: ❌ Error — ${msg}`);
+  }
+
+  // ── Wallet ─────────────────────────────────────────────────────────────────
+  const walletAddr = polymarket.getWalletAddress();
+  if (walletAddr) {
+    lines.push(`- Wallet address: ${walletAddr.slice(0, 6)}...${walletAddr.slice(-4)}`);
+  } else {
+    lines.push(`- Wallet address: N/A (sin clave privada)`);
+  }
+
+  // ── USDC balance ───────────────────────────────────────────────────────────
+  const balance = await polymarket.getUsdcBalance();
+  if (balance >= 0) {
+    lines.push(`- USDC balance: $${balance.toFixed(2)}`);
+  } else {
+    lines.push(`- USDC balance: ❌ Error al consultar`);
+  }
+
+  // ── Active markets per symbol ──────────────────────────────────────────────
+  let nextClose: Date | null = null;
+  const marketCounts: Record<string, number> = {};
+
+  for (const sym of ['BTC', 'ETH', 'SOL']) {
+    try {
+      const markets = await polymarket.getActiveCryptoMarkets(sym);
+      marketCounts[sym] = markets.length;
+      lines.push(`- Mercados ${sym} activos encontrados: ${markets.length}`);
+
+      for (const m of markets) {
+        const expiry = new Date(m.endDateIso);
+        if (!nextClose || expiry < nextClose) nextClose = expiry;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      marketCounts[sym] = 0;
+      lines.push(`- Mercados ${sym}: ❌ Error — ${msg}`);
+    }
+  }
+
+  // ── Next market close ──────────────────────────────────────────────────────
+  if (nextClose) {
+    const hh = nextClose.getUTCHours().toString().padStart(2, '0');
+    const mm = nextClose.getUTCMinutes().toString().padStart(2, '0');
+    const ss = nextClose.getUTCSeconds().toString().padStart(2, '0');
+    lines.push(`- Próximo cierre de mercado: ${hh}:${mm}:${ss} UTC`);
+  } else {
+    lines.push(`- Próximo cierre de mercado: no encontrado`);
+  }
+
+  telegram.sendLog(lines.join('\n'));
+
+  // Send per-symbol warning if 0 markets found
+  for (const sym of ['BTC', 'ETH', 'SOL']) {
+    if ((marketCounts[sym] ?? 0) === 0) {
+      telegram.sendLog(
+        `⚠️ Sin mercados activos para ${sym} — la estrategia no puede operar`
+      );
+    }
+  }
+}
+
 // ─── Startup ──────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -401,7 +606,6 @@ async function main(): Promise<void> {
   sniper.setLogFn(logFn);
 
   telegram.notifyBotStarted();
-  telegram.sendFiveMinuteSummary();
 
   // Start Binance feed
   binance.connect();
@@ -422,6 +626,10 @@ async function main(): Promise<void> {
   // Wait briefly for initial price data
   logger.info('[Bot] Waiting 3s for initial price data...');
   await sleep(3000);
+
+  // Run startup diagnostic and send full status to Telegram
+  logger.info('[Bot] Running startup diagnostic...');
+  await runStartupDiagnostic();
 
   // Start evaluation loop
   logger.info(`[Bot] Starting evaluation loop (every ${EVAL_INTERVAL_MS}ms)`);

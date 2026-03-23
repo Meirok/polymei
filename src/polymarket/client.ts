@@ -21,7 +21,7 @@ import {
   OrderType as ClobOrderType,
   Chain,
 } from '@polymarket/clob-client';
-import { Wallet } from 'ethers';
+import { Wallet, ethers } from 'ethers';
 import {
   POLYMARKET_PRIVATE_KEY,
   CLOB_HOST,
@@ -160,50 +160,163 @@ export class PolymarketClient {
     return this.clobClient;
   }
 
+  // ─── Wallet / Balance ─────────────────────────────────────────────────────
+
+  getWalletAddress(): string | null {
+    return this.wallet?.address ?? null;
+  }
+
+  async getUsdcBalance(): Promise<number> {
+    if (!this.wallet) return -1;
+    try {
+      // USDC on Polygon Mainnet (native USDC)
+      const USDC_POLYGON = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359';
+      const provider = new ethers.providers.JsonRpcProvider('https://polygon-rpc.com');
+      const usdc = new ethers.Contract(
+        USDC_POLYGON,
+        ['function balanceOf(address owner) view returns (uint256)'],
+        provider
+      );
+      const raw: ethers.BigNumber = await usdc.balanceOf(this.wallet.address);
+      return parseFloat(ethers.utils.formatUnits(raw, 6));
+    } catch {
+      // Try USDC.e (bridged) as fallback
+      try {
+        const USDCE_POLYGON = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+        const provider = new ethers.providers.JsonRpcProvider('https://polygon-rpc.com');
+        const usdc = new ethers.Contract(
+          USDCE_POLYGON,
+          ['function balanceOf(address owner) view returns (uint256)'],
+          provider
+        );
+        const raw: ethers.BigNumber = await usdc.balanceOf(this.wallet.address);
+        return parseFloat(ethers.utils.formatUnits(raw, 6));
+      } catch {
+        return -1;
+      }
+    }
+  }
+
   // ─── Market Discovery ──────────────────────────────────────────────────────
 
   /**
    * Find active 5-minute markets for a given symbol (BTC, ETH, SOL…).
-   * Queries Gamma API, filters by question keywords and near-term expiry.
+   *
+   * Tries three approaches in order:
+   *   1. Gamma API with tag_slug=crypto, filter by symbol + 10-min expiry window
+   *   2. Gamma API without tag filter (broader search)
+   *   3. Direct CLOB API /markets endpoint as last resort
+   *
+   * Each step is logged to Telegram so we can see exactly where discovery fails.
    */
   async getActiveCryptoMarkets(symbol: string): Promise<GammaMarket[]> {
-    try {
-      const now = Date.now();
-      const fiveMin = 5 * 60 * 1000;
-      // Look ahead 15 minutes
-      const windowEnd = now + 15 * 60 * 1000;
+    const now = Date.now();
+    const windowEnd = now + 10 * 60 * 1000; // 10-minute look-ahead
+    const sym = symbol.toUpperCase();
 
+    const filterMarkets = (all: GammaMarket[]): {
+      bySymbol: GammaMarket[];
+      byExpiry: GammaMarket[];
+    } => {
+      const bySymbol = all.filter((m) => m.question?.toUpperCase().includes(sym));
+      const byExpiry = bySymbol.filter((m) => {
+        if (!m.endDateIso) return false;
+        const exp = new Date(m.endDateIso).getTime();
+        return exp > now && exp <= windowEnd;
+      });
+      return { bySymbol, byExpiry };
+    };
+
+    const queryGamma = async (extraParams: Record<string, string>): Promise<GammaMarket[]> => {
       const params = new URLSearchParams({
         active: 'true',
         closed: 'false',
         order: 'endDateIso',
         ascending: 'true',
-        limit: '50',
-        tag_slug: 'crypto',
+        limit: '100',
+        ...extraParams,
       });
+      const resp = await fetch(`${GAMMA_API}/markets?${params}`);
+      if (!resp.ok) throw new Error(`Gamma ${resp.status}: ${resp.statusText}`);
+      return (await resp.json()) as GammaMarket[];
+    };
 
-      const url = `${GAMMA_API}/markets?${params}`;
-      const resp = await fetch(url);
-      if (!resp.ok) {
-        const errMsg = `Gamma API ${resp.status}: ${resp.statusText}`;
-        this.logFn?.(`⚠️ ERROR: polymarket\n- Módulo: polymarket\n- Detalle: ${errMsg}\n- Acción: skipping cycle`);
-        throw new Error(errMsg);
+    // ── Attempt 1: Gamma with crypto tag ────────────────────────────────────
+    try {
+      const all = await queryGamma({ tag_slug: 'crypto' });
+      const { bySymbol, byExpiry } = filterMarkets(all);
+
+      this.logFn?.(
+        `🔍 [${sym}] Gamma (tag=crypto): total=${all.length} | ` +
+        `con '${sym}'=${bySymbol.length} | expiran <10min=${byExpiry.length}` +
+        (byExpiry[0] ? `\n- Mejor: "${byExpiry[0].question}"` : '')
+      );
+
+      if (byExpiry.length > 0) return byExpiry;
+
+      // If tag search found symbol matches but none in window, don't try broader search
+      if (bySymbol.length > 0) {
+        this.logFn?.(
+          `⚠️ [${sym}] ${bySymbol.length} mercados encontrados pero ninguno cierra en <10min\n` +
+          `- Próximo cierre: ${bySymbol[0]?.endDateIso ?? 'desconocido'}`
+        );
       }
-      const markets = await resp.json() as GammaMarket[];
-
-      // Filter: must mention the symbol and expire within the next 15 minutes
-      return markets.filter((m) => {
-        if (!m.question) return false;
-        const q = m.question.toUpperCase();
-        if (!q.includes(symbol.toUpperCase())) return false;
-        if (!m.endDateIso) return false;
-        const expiry = new Date(m.endDateIso).getTime();
-        return expiry > now && expiry < windowEnd;
-      });
     } catch (err) {
-      logger.error(`[PolymarketClient] getActiveCryptoMarkets error`, err);
-      return [];
+      this.logFn?.(`⚠️ [${sym}] Gamma (tag=crypto) falló: ${err instanceof Error ? err.message : String(err)}`);
     }
+
+    // ── Attempt 2: Gamma without tag (broader) ───────────────────────────────
+    try {
+      const all = await queryGamma({});
+      const { bySymbol, byExpiry } = filterMarkets(all);
+
+      this.logFn?.(
+        `🔍 [${sym}] Gamma (sin tag): total=${all.length} | ` +
+        `con '${sym}'=${bySymbol.length} | expiran <10min=${byExpiry.length}` +
+        (byExpiry[0] ? `\n- Mejor: "${byExpiry[0].question}"` : '')
+      );
+
+      if (byExpiry.length > 0) return byExpiry;
+    } catch (err) {
+      this.logFn?.(`⚠️ [${sym}] Gamma (sin tag) falló: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // ── Attempt 3: Direct CLOB API ───────────────────────────────────────────
+    try {
+      const resp = await fetch(`${CLOB_HOST}/markets?active=true&closed=false`);
+      if (resp.ok) {
+        const data = await resp.json() as any;
+        const raw: any[] = Array.isArray(data) ? data : (data?.data ?? data?.markets ?? []);
+
+        // Normalize CLOB market shape to GammaMarket
+        const normalized: GammaMarket[] = raw.map((m: any) => ({
+          id: m.id ?? m.condition_id ?? '',
+          conditionId: m.condition_id ?? m.conditionId ?? m.id ?? '',
+          question: m.question ?? '',
+          slug: m.slug ?? '',
+          active: true,
+          closed: false,
+          endDateIso: m.end_date_iso ?? m.endDateIso ?? m.expiration ?? '',
+          tokens: m.tokens ?? [],
+        }));
+
+        const { bySymbol, byExpiry } = filterMarkets(normalized);
+
+        this.logFn?.(
+          `🔍 [${sym}] CLOB directo: total=${raw.length} | ` +
+          `con '${sym}'=${bySymbol.length} | expiran <10min=${byExpiry.length}` +
+          (byExpiry[0] ? `\n- Mejor: "${byExpiry[0].question}"` : '')
+        );
+
+        if (byExpiry.length > 0) return byExpiry;
+      } else {
+        this.logFn?.(`⚠️ [${sym}] CLOB directo: ${resp.status} ${resp.statusText}`);
+      }
+    } catch (err) {
+      this.logFn?.(`⚠️ [${sym}] CLOB directo falló: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    return [];
   }
 
   /**

@@ -280,56 +280,68 @@ export class TelegramNotifier {
     );
   }
 
-  // ─── 5-Minute Summary ─────────────────────────────────────────────────────
+  // ─── Market Close Summary ─────────────────────────────────────────────────
 
   /**
-   * Builds and sends a 5-minute rolling summary message, resets period counters,
-   * and (on first call) schedules itself to run every 5 minutes via setInterval.
+   * Send a summary when a Polymarket 5-minute market closes.
+   * Called by bot.ts whenever a tracked market's expiry timestamp is passed.
    */
-  sendFiveMinuteSummary(): void {
-    const now = new Date();
-    const hh = now.getHours().toString().padStart(2, '0');
-    const mm = now.getMinutes().toString().padStart(2, '0');
+  notifyMarketClose(params: {
+    symbol: string;
+    marketTime: string;       // e.g. "06:00 UTC"
+    question: string;         // market question text
+    betPlaced: boolean;
+    betSide?: 'YES' | 'NO';
+    betAmount?: number;
+    betOdds?: number;
+    result?: 'win' | 'loss' | 'pending';
+    pnlFromBet?: number;
+    noTradeReason?: string;
+    priceAtClose: number;
+    dailyPnl: number;
+  }): void {
+    const dry = DRY_RUN ? ' [DRY RUN]' : '';
 
-    const s = botState;
+    let betStr: string;
+    if (params.betPlaced && params.betSide) {
+      betStr =
+        `✅ ${params.betSide} $${params.betAmount?.toFixed(2) ?? '?'} @ ${params.betOdds?.toFixed(3) ?? '?'}`;
+    } else {
+      betStr = `❌ No`;
+    }
 
-    const pnlSign = s.pnlPeriod >= 0 ? '+' : '-';
-    const pnlStr = `${pnlSign}$${Math.abs(s.pnlPeriod).toFixed(2)}`;
+    let resultStr: string;
+    if (!params.betPlaced) {
+      resultStr = '— sin posición';
+    } else if (params.result === 'win') {
+      resultStr = `💰 +$${(params.pnlFromBet ?? 0).toFixed(2)} ganado`;
+    } else if (params.result === 'loss') {
+      resultStr = `💸 -$${Math.abs(params.pnlFromBet ?? 0).toFixed(2)} perdido`;
+    } else {
+      resultStr = '⏳ pendiente de resolución';
+    }
 
-    const pctChange = (current: number, prev: number): string => {
-      if (prev <= 0) return '+0.00%';
-      const pct = ((current - prev) / prev) * 100;
-      return `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`;
-    };
+    const priceStr = params.priceAtClose > 0
+      ? `$${Math.round(params.priceAtClose).toLocaleString('en-US')}`
+      : 'N/A';
 
-    const fmtPrice = (p: number): string =>
-      p > 0 ? Math.round(p).toLocaleString('en-US') : '0';
+    const pnlStr = `${params.dailyPnl >= 0 ? '+' : ''}$${params.dailyPnl.toFixed(2)}`;
 
-    const mode = DRY_RUN ? 'DRY RUN' : 'LIVE';
+    let msg =
+      `📊 Cierre de mercado${dry} — ${params.symbol} ${params.marketTime}\n` +
+      `- ¿Apostamos?: ${betStr}\n` +
+      `- Resultado: ${resultStr}\n`;
 
-    const msg =
-      `📊 *Resumen últimos 5 min*\n` +
-      `🕐 ${hh}:${mm}\n` +
-      `🔍 Señales detectadas: ${s.signalsDetected}\n` +
-      `✅ Órdenes ejecutadas: ${s.ordersPlaced}\n` +
-      `❌ Órdenes rechazadas (baja confianza): ${s.ordersRejected}\n` +
-      `💰 P&L del período: ${pnlStr}\n` +
-      `📈 Posiciones abiertas: ${s.openPositions}\n` +
-      `BTC: $${fmtPrice(s.currentPrices.BTC)} (${pctChange(s.currentPrices.BTC, s.prevPrices.BTC)})\n` +
-      `ETH: $${fmtPrice(s.currentPrices.ETH)} (${pctChange(s.currentPrices.ETH, s.prevPrices.ETH)})\n` +
-      `SOL: $${fmtPrice(s.currentPrices.SOL)} (${pctChange(s.currentPrices.SOL, s.prevPrices.SOL)})\n` +
-      `🟢 Bot activo | ${mode}`;
+    if (!params.betPlaced && params.noTradeReason) {
+      msg += `- Razón de no apostar: ${params.noTradeReason}\n`;
+    }
+
+    msg +=
+      `- ${params.symbol} al cierre: ${priceStr}\n` +
+      `- P&L acumulado hoy: ${pnlStr}`;
 
     this.send(msg);
     resetPeriodCounters();
-
-    // Start the recurring interval on first call
-    if (!this.fiveMinSummaryTimer) {
-      this.fiveMinSummaryTimer = setInterval(
-        () => this.sendFiveMinuteSummary(),
-        300_000
-      );
-    }
   }
 
   // ─── Low-level Send ────────────────────────────────────────────────────────

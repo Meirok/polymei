@@ -65,5 +65,9 @@ export const DASHBOARD_INTERVAL_MS = 2000;
 export const TELEGRAM_BOT_TOKEN = optionalEnv('TELEGRAM_BOT_TOKEN', '');
 export const TELEGRAM_CHAT_ID = optionalEnv('TELEGRAM_CHAT_ID', '');
 
+// ─── Debug ───────────────────────────────────────────────────────────────────
+/** When true, send 30-second loop status messages to Telegram for diagnostics */
+export const DEBUG_MODE = optionalEnv('DEBUG_MODE', 'true') !== 'false';
+
 // ─── Logging ─────────────────────────────────────────────────────────────────
 export const LOG_LEVEL = optionalEnv('LOG_LEVEL', 'info');
