@@ -11,11 +11,11 @@
  *   /config  — show current config
  *
  * Notifications sent automatically:
- *   🎯 Signal detected
- *   ✅ Order placed
- *   💰 Win
- *   ❌ Loss
- *   ⚠️  Risk alert
+ *   🔍 Signal evaluated (accepted or rejected)
+ *   🎯 Order placed
+ *   ✅ Win / ❌ Loss
+ *   🏪 Market discovery
+ *   ⚠️  Errors
  *   📊 Daily summary (midnight)
  *   🔴 Bot stopped
  */
@@ -29,6 +29,9 @@ import {
   DAILY_LOSS_LIMIT_USD,
   MAX_CONCURRENT_POSITIONS,
   MIN_CONFIDENCE,
+  MIN_PRICE_CHANGE_PCT,
+  SNIPE_WINDOW_START,
+  SNIPE_WINDOW_END,
   SYMBOLS,
 } from '../../config.js';
 import { logger } from '../utils/logger.js';
@@ -122,18 +125,39 @@ export class TelegramNotifier {
 
   // ─── Notification Methods ─────────────────────────────────────────────────
 
+  /**
+   * General-purpose log message. Used for diagnostics, market discovery, signal
+   * evaluations, and any other structured output that should appear in Telegram.
+   */
+  sendLog(message: string): void {
+    this.send(message);
+  }
+
+  /**
+   * Notify about an error with structured context.
+   */
+  notifyError(module: string, detail: string, action: string): void {
+    this.send(
+      `⚠️ ERROR: ${module}\n` +
+      `- Módulo: ${module}\n` +
+      `- Detalle: ${detail}\n` +
+      `- Acción: ${action}`
+    );
+  }
+
   notifySignal(signal: TradeSignal): void {
     const dry = DRY_RUN ? ' [DRY RUN]' : '';
     const dir = signal.action === 'BUY_YES' ? '📈' : '📉';
     const polyPrice = signal.action === 'BUY_YES' ? signal.polyYes : signal.polyNo;
+    const side = signal.action === 'BUY_YES' ? 'YES (precio sube)' : 'NO (precio baja)';
 
     this.send(
-      `🎯 SIGNAL DETECTED${dry}\n` +
-      `${dir} [${signal.symbol}] ${signal.action}\n` +
-      `Change: ${signal.binanceChange >= 0 ? '+' : ''}${signal.binanceChange.toFixed(3)}%\n` +
-      `Poly odds: ${polyPrice.toFixed(3)}\n` +
-      `Confidence: ${signal.confidence}%\n` +
-      `Time left: ${signal.secondsRemaining.toFixed(0)}s`
+      `🎯 [${signal.symbol}] Señal detectada${dry}\n` +
+      `${dir} Dirección: ${side}\n` +
+      `- Odds Polymarket: ${polyPrice.toFixed(3)}\n` +
+      `- Cambio Binance: ${signal.binanceChange >= 0 ? '+' : ''}${signal.binanceChange.toFixed(3)}%\n` +
+      `- Confianza: ${signal.confidence}/100\n` +
+      `- Tiempo restante en vela: ${signal.secondsRemaining.toFixed(0)}s`
     );
   }
 
@@ -142,35 +166,40 @@ export class TelegramNotifier {
     position: ManagedPosition
   ): void {
     const dry = DRY_RUN ? ' [DRY RUN]' : '';
-    const dir = signal.action === 'BUY_YES' ? '📈' : '📉';
+    const side = signal.action === 'BUY_YES' ? 'YES (precio sube)' : 'NO (precio baja)';
 
     this.send(
-      `✅ ORDER PLACED${dry}\n` +
-      `${dir} [${signal.symbol}] Bought ${position.side} $${position.costUsd.toFixed(2)} @ ${position.entryPrice.toFixed(3)}\n` +
-      `Market closes in ${signal.secondsRemaining.toFixed(0)}s\n` +
-      `Q: ${signal.question}`
+      `🎯 [${signal.symbol}] Apuesta ejecutada${dry}\n` +
+      `- Dirección: ${side}\n` +
+      `- Monto: $${position.costUsd.toFixed(2)}\n` +
+      `- Odds Polymarket: ${position.entryPrice.toFixed(3)}\n` +
+      `- Cambio Binance: ${signal.binanceChange >= 0 ? '+' : ''}${signal.binanceChange.toFixed(3)}%\n` +
+      `- Confianza: ${signal.confidence}/100\n` +
+      `- Tiempo restante en vela: ${signal.secondsRemaining.toFixed(0)}s`
     );
   }
 
   notifyWin(position: ManagedPosition): void {
     const dry = DRY_RUN ? ' [DRY RUN]' : '';
     const pnl = position.pnlUsd ?? 0;
+    const exitPrice = position.exitPrice ?? 1;
 
     this.send(
-      `💰 WIN${dry}\n` +
-      `[${position.symbol}] +$${pnl.toFixed(2)} profit\n` +
-      `Position closed at ${(position.exitPrice ?? 1).toFixed(3)}`
+      `✅ [${position.symbol}] GANADA +$${pnl.toFixed(2)}${dry}\n` +
+      `- Entrada: ${position.side} @ ${position.entryPrice.toFixed(3)}\n` +
+      `- Resolución: ${exitPrice.toFixed(3)}`
     );
   }
 
   notifyLoss(position: ManagedPosition): void {
     const dry = DRY_RUN ? ' [DRY RUN]' : '';
     const pnl = position.pnlUsd ?? 0;
+    const exitPrice = position.exitPrice ?? 0;
 
     this.send(
-      `❌ LOSS${dry}\n` +
-      `[${position.symbol}] -$${Math.abs(pnl).toFixed(2)} loss\n` +
-      `Resolved against ${position.side} position`
+      `❌ [${position.symbol}] PERDIDA -$${Math.abs(pnl).toFixed(2)}${dry}\n` +
+      `- Entrada: ${position.side} @ ${position.entryPrice.toFixed(3)}\n` +
+      `- Resolución: ${exitPrice.toFixed(3)}`
     );
   }
 
@@ -183,13 +212,19 @@ export class TelegramNotifier {
   }
 
   notifyBotStarted(): void {
-    const mode = DRY_RUN ? '🧪 DRY RUN' : '🔴 LIVE';
+    const mode = DRY_RUN ? '🧪 DRY RUN' : '🟢 LIVE';
+    const version = new Date().toISOString();
+
     this.send(
-      `🟢 SNIPER BOT STARTED\n` +
-      `Mode: ${mode}\n` +
-      `Symbols: ${SYMBOLS.join(', ')}\n` +
-      `Max position: $${MAX_POSITION_USD}\n` +
-      `Daily limit: $${DAILY_LOSS_LIMIT_USD}`
+      `🟢 Bot iniciado en modo ${DRY_RUN ? 'DRY RUN' : 'LIVE'}\n` +
+      `- Símbolos: ${SYMBOLS.join(', ')}\n` +
+      `- Posición máx: $${MAX_POSITION_USD}\n` +
+      `- Límite diario: $${DAILY_LOSS_LIMIT_USD}\n` +
+      `- Threshold movimiento: ${MIN_PRICE_CHANGE_PCT}%\n` +
+      `- Confianza mínima: ${MIN_CONFIDENCE}\n` +
+      `- Ventana snipe: ${SNIPE_WINDOW_START}s → ${SNIPE_WINDOW_END}s antes del cierre\n` +
+      `- Modo: ${mode}\n` +
+      `- Versión: ${version}`
     );
   }
 
@@ -239,7 +274,9 @@ export class TelegramNotifier {
       `Max position: $${MAX_POSITION_USD}\n` +
       `Max concurrent: ${MAX_CONCURRENT_POSITIONS}\n` +
       `Daily loss limit: $${DAILY_LOSS_LIMIT_USD}\n` +
-      `Min confidence: ${MIN_CONFIDENCE}%`
+      `Min confidence: ${MIN_CONFIDENCE}\n` +
+      `Min price change: ${MIN_PRICE_CHANGE_PCT}%\n` +
+      `Snipe window: ${SNIPE_WINDOW_START}s → ${SNIPE_WINDOW_END}s`
     );
   }
 

@@ -133,10 +133,18 @@ export class Sniper {
   private lastSignalTime: Map<string, number> = new Map();
   private readonly SIGNAL_COOLDOWN_MS = 30_000; // 30s between signals for same symbol
 
+  // Optional callback for sending log messages to Telegram
+  private logFn?: (msg: string) => void;
+
   constructor(
     private binance: BinanceFeed,
     private polymarket: PolymarketClient
   ) {}
+
+  /** Set a callback for sending diagnostic messages to Telegram */
+  setLogFn(fn: (msg: string) => void): void {
+    this.logFn = fn;
+  }
 
   /**
    * Evaluate a single symbol for a trade signal.
@@ -145,59 +153,143 @@ export class Sniper {
   async evaluateTrade(symbol: string): Promise<TradeSignal | null> {
     const secondsRemaining = secondsUntilNext5MinBoundary();
 
-    // Only snipe inside the configured window
+    // ── Always log current state to console (every evaluation cycle) ─────────
+    const priceStateEarly = this.binance.getState(symbol);
+    const changeEarly = priceStateEarly?.changePercent ?? 0;
+    const momentumEarly = priceStateEarly?.momentum ?? 0;
+    const priceEarly = priceStateEarly?.currentPrice ?? 0;
+
+    logger.debug(
+      `[Sniper:${symbol}] ` +
+      `segs=${secondsRemaining.toFixed(1)}s | ` +
+      `cambio=${changeEarly >= 0 ? '+' : ''}${changeEarly.toFixed(3)}% | ` +
+      `momentum=${momentumEarly >= 0 ? '+' : ''}${momentumEarly.toFixed(4)} | ` +
+      `precio=$${priceEarly.toLocaleString('en-US')}`
+    );
+
+    // ── 1. Time window check ─────────────────────────────────────────────────
     if (secondsRemaining > SNIPE_WINDOW_START || secondsRemaining < SNIPE_WINDOW_END) {
+      logger.debug(
+        `[Sniper:${symbol}] SKIP — fuera de ventana ` +
+        `(${secondsRemaining.toFixed(1)}s, ventana: ${SNIPE_WINDOW_END}s–${SNIPE_WINDOW_START}s)`
+      );
       return null;
     }
 
-    // Cooldown check
+    // ── 2. Cooldown check ────────────────────────────────────────────────────
     const lastSignal = this.lastSignalTime.get(symbol) ?? 0;
-    if (Date.now() - lastSignal < this.SIGNAL_COOLDOWN_MS) {
+    const msSinceLast = Date.now() - lastSignal;
+    if (msSinceLast < this.SIGNAL_COOLDOWN_MS) {
+      logger.debug(
+        `[Sniper:${symbol}] SKIP — cooldown activo ` +
+        `(${((this.SIGNAL_COOLDOWN_MS - msSinceLast) / 1000).toFixed(0)}s restantes)`
+      );
       return null;
     }
 
+    // ── 3. Price state check ─────────────────────────────────────────────────
     const priceState = this.binance.getState(symbol);
-    if (!priceState || priceState.currentPrice === 0) return null;
+    if (!priceState || priceState.currentPrice === 0) {
+      logger.debug(`[Sniper:${symbol}] SKIP — sin datos de precio Binance`);
+      return null;
+    }
 
     const change = priceState.changePercent;
     const momentum = priceState.momentum;
 
-    // Determine direction
-    const isLong = change > MIN_PRICE_CHANGE_PCT && momentum >= 0;
+    // ── 4. Direction check ───────────────────────────────────────────────────
+    const isLong  = change > MIN_PRICE_CHANGE_PCT && momentum >= 0;
     const isShort = change < -MIN_PRICE_CHANGE_PCT && momentum <= 0;
-    if (!isLong && !isShort) return null;
 
-    // Get Polymarket odds
+    if (!isLong && !isShort) {
+      logger.debug(
+        `[Sniper:${symbol}] SKIP — sin dirección clara ` +
+        `(cambio=${change >= 0 ? '+' : ''}${change.toFixed(3)}% vs umbral ±${MIN_PRICE_CHANGE_PCT}%, ` +
+        `momentum=${momentum >= 0 ? '+' : ''}${momentum.toFixed(4)})`
+      );
+      return null;
+    }
+
+    const direction = isLong ? 'LONG (YES)' : 'SHORT (NO)';
+    logger.debug(
+      `[Sniper:${symbol}] Evaluando señal ${direction} ` +
+      `| cambio=${change >= 0 ? '+' : ''}${change.toFixed(3)}% ` +
+      `| ${secondsRemaining.toFixed(1)}s restantes`
+    );
+
+    // ── 5. Polymarket market discovery ───────────────────────────────────────
     const market = await this.polymarket.findCurrentMarket(
       symbol,
       isLong ? 'above' : 'below'
     );
     if (!market) {
-      logger.debug(`[Sniper] No active market found for ${symbol}`);
+      // "no market" is already logged to Telegram by PolymarketClient.findCurrentMarket
+      logger.debug(`[Sniper:${symbol}] SKIP — sin mercado Polymarket`);
       return null;
     }
 
+    // ── 6. Get Polymarket odds ────────────────────────────────────────────────
     const odds = await this.polymarket.getPolymarketOdds(market);
-    if (!odds) return null;
+    if (!odds) {
+      logger.debug(`[Sniper:${symbol}] SKIP — no se pudo obtener odds de Polymarket`);
+      return null;
+    }
 
-    // Evaluate entry prices
-    // Long: buy YES if YES price is still cheap (mispriced low)
-    // Short: buy NO  if NO  price is still cheap (mispriced low)
+    const expiresInSec = Math.round(
+      (new Date(market.endDateIso).getTime() - Date.now()) / 1000
+    );
+
+    this.logFn?.(
+      `🏪 [${symbol}] Mercado encontrado: '${market.question}'\n` +
+      `- YES: ${odds.yes.toFixed(3)} | NO: ${odds.no.toFixed(3)}\n` +
+      `- Vence en: ${expiresInSec}s`
+    );
+
+    logger.debug(
+      `[Sniper:${symbol}] Odds — YES: ${odds.yes.toFixed(3)}, NO: ${odds.no.toFixed(3)} | ` +
+      `mercado: ${market.question}`
+    );
+
+    // ── 7. Entry price check ─────────────────────────────────────────────────
     const MAX_ENTRY_PRICE = 0.82;
-
     let action: TradeAction;
     let polyPrice: number;
 
     if (isLong) {
-      if (odds.yes >= MAX_ENTRY_PRICE) return null; // already priced in
+      if (odds.yes >= MAX_ENTRY_PRICE) {
+        logger.debug(
+          `[Sniper:${symbol}] SKIP — YES ya priceado en ${odds.yes.toFixed(3)} ≥ ${MAX_ENTRY_PRICE}`
+        );
+        this.logFn?.(
+          `🔍 [${symbol}] Señal evaluada\n` +
+          `- Cambio vela: ${change >= 0 ? '+' : ''}${change.toFixed(3)}%\n` +
+          `- Segundos restantes: ${secondsRemaining.toFixed(0)}s\n` +
+          `- Odds YES: ${odds.yes.toFixed(3)}\n` +
+          `- Resultado: ❌ Rechazada (YES ya priceado ≥ ${MAX_ENTRY_PRICE})`
+        );
+        return null;
+      }
       action = 'BUY_YES';
       polyPrice = odds.yes;
     } else {
-      if (odds.no >= MAX_ENTRY_PRICE) return null;
+      if (odds.no >= MAX_ENTRY_PRICE) {
+        logger.debug(
+          `[Sniper:${symbol}] SKIP — NO ya priceado en ${odds.no.toFixed(3)} ≥ ${MAX_ENTRY_PRICE}`
+        );
+        this.logFn?.(
+          `🔍 [${symbol}] Señal evaluada\n` +
+          `- Cambio vela: ${change >= 0 ? '+' : ''}${change.toFixed(3)}%\n` +
+          `- Segundos restantes: ${secondsRemaining.toFixed(0)}s\n` +
+          `- Odds NO: ${odds.no.toFixed(3)}\n` +
+          `- Resultado: ❌ Rechazada (NO ya priceado ≥ ${MAX_ENTRY_PRICE})`
+        );
+        return null;
+      }
       action = 'BUY_NO';
       polyPrice = odds.no;
     }
 
+    // ── 8. Confidence scoring ─────────────────────────────────────────────────
     const confidence = calculateConfidence(
       change,
       momentum,
@@ -206,12 +298,35 @@ export class Sniper {
       action
     );
 
+    logger.debug(
+      `[Sniper:${symbol}] Confianza: ${confidence}/100 ` +
+      `(umbral: ${MIN_CONFIDENCE}) | acción: ${action}`
+    );
+
     if (confidence < MIN_CONFIDENCE) {
       logger.debug(
-        `[Sniper] ${symbol} confidence ${confidence} < ${MIN_CONFIDENCE} threshold — skip`
+        `[Sniper:${symbol}] SKIP — confianza ${confidence} < ${MIN_CONFIDENCE}`
+      );
+      this.logFn?.(
+        `🔍 [${symbol}] Señal evaluada\n` +
+        `- Cambio vela: ${change >= 0 ? '+' : ''}${change.toFixed(3)}%\n` +
+        `- Segundos restantes: ${secondsRemaining.toFixed(0)}s\n` +
+        `- Odds ${action === 'BUY_YES' ? 'YES' : 'NO'}: ${polyPrice.toFixed(3)}\n` +
+        `- Confianza: ${confidence}/100\n` +
+        `- Resultado: ❌ Rechazada (confianza < mínimo ${MIN_CONFIDENCE})`
       );
       return null;
     }
+
+    // ── 9. Signal accepted ────────────────────────────────────────────────────
+    this.logFn?.(
+      `🔍 [${symbol}] Señal evaluada\n` +
+      `- Cambio vela: ${change >= 0 ? '+' : ''}${change.toFixed(3)}%\n` +
+      `- Segundos restantes: ${secondsRemaining.toFixed(0)}s\n` +
+      `- Odds ${action === 'BUY_YES' ? 'YES' : 'NO'}: ${polyPrice.toFixed(3)}\n` +
+      `- Confianza: ${confidence}/100\n` +
+      `- Resultado: ✅ Aceptada`
+    );
 
     // Mark cooldown
     this.lastSignalTime.set(symbol, Date.now());
