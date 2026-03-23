@@ -34,6 +34,7 @@ import {
 import { logger } from '../utils/logger.js';
 import type { TradeSignal } from '../strategies/sniper.js';
 import type { ManagedPosition, RiskSnapshot } from '../risk/manager.js';
+import { botState, resetPeriodCounters } from '../state.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -48,6 +49,7 @@ export class TelegramNotifier {
   private commandHandlers: Map<BotCommand, CommandHandler> = new Map();
   private enabled: boolean;
   private dailySummaryTimer: NodeJS.Timeout | null = null;
+  private fiveMinSummaryTimer: NodeJS.Timeout | null = null;
 
   constructor() {
     this.enabled = !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
@@ -87,6 +89,9 @@ export class TelegramNotifier {
     }
     if (this.dailySummaryTimer) {
       clearTimeout(this.dailySummaryTimer);
+    }
+    if (this.fiveMinSummaryTimer) {
+      clearInterval(this.fiveMinSummaryTimer);
     }
   }
 
@@ -236,6 +241,58 @@ export class TelegramNotifier {
       `Daily loss limit: $${DAILY_LOSS_LIMIT_USD}\n` +
       `Min confidence: ${MIN_CONFIDENCE}%`
     );
+  }
+
+  // ─── 5-Minute Summary ─────────────────────────────────────────────────────
+
+  /**
+   * Builds and sends a 5-minute rolling summary message, resets period counters,
+   * and (on first call) schedules itself to run every 5 minutes via setInterval.
+   */
+  sendFiveMinuteSummary(): void {
+    const now = new Date();
+    const hh = now.getHours().toString().padStart(2, '0');
+    const mm = now.getMinutes().toString().padStart(2, '0');
+
+    const s = botState;
+
+    const pnlSign = s.pnlPeriod >= 0 ? '+' : '-';
+    const pnlStr = `${pnlSign}$${Math.abs(s.pnlPeriod).toFixed(2)}`;
+
+    const pctChange = (current: number, prev: number): string => {
+      if (prev <= 0) return '+0.00%';
+      const pct = ((current - prev) / prev) * 100;
+      return `${pct >= 0 ? '+' : ''}${pct.toFixed(2)}%`;
+    };
+
+    const fmtPrice = (p: number): string =>
+      p > 0 ? Math.round(p).toLocaleString('en-US') : '0';
+
+    const mode = DRY_RUN ? 'DRY RUN' : 'LIVE';
+
+    const msg =
+      `📊 *Resumen últimos 5 min*\n` +
+      `🕐 ${hh}:${mm}\n` +
+      `🔍 Señales detectadas: ${s.signalsDetected}\n` +
+      `✅ Órdenes ejecutadas: ${s.ordersPlaced}\n` +
+      `❌ Órdenes rechazadas (baja confianza): ${s.ordersRejected}\n` +
+      `💰 P&L del período: ${pnlStr}\n` +
+      `📈 Posiciones abiertas: ${s.openPositions}\n` +
+      `BTC: $${fmtPrice(s.currentPrices.BTC)} (${pctChange(s.currentPrices.BTC, s.prevPrices.BTC)})\n` +
+      `ETH: $${fmtPrice(s.currentPrices.ETH)} (${pctChange(s.currentPrices.ETH, s.prevPrices.ETH)})\n` +
+      `SOL: $${fmtPrice(s.currentPrices.SOL)} (${pctChange(s.currentPrices.SOL, s.prevPrices.SOL)})\n` +
+      `🟢 Bot activo | ${mode}`;
+
+    this.send(msg);
+    resetPeriodCounters();
+
+    // Start the recurring interval on first call
+    if (!this.fiveMinSummaryTimer) {
+      this.fiveMinSummaryTimer = setInterval(
+        () => this.sendFiveMinuteSummary(),
+        300_000
+      );
+    }
   }
 
   // ─── Low-level Send ────────────────────────────────────────────────────────
