@@ -183,6 +183,12 @@ export class PolymarketClient {
       passphrase: process.env.POLY_PASSPHRASE!,
     };
 
+    console.log('[Auth] Derived creds:', {
+      key: creds.key,
+      secret: creds.secret ? creds.secret.slice(0, 8) + '...' : 'UNDEFINED',
+      passphrase: creds.passphrase ? creds.passphrase.slice(0, 8) + '...' : 'UNDEFINED',
+    });
+
     // Pass POLY_ADDRESS as grantedAuth so ClobClient uses the correct account,
     // not the address derived from the private key.
     this.clobClient = new ClobClient(
@@ -428,6 +434,23 @@ export class PolymarketClient {
    * sizeUsd is the dollar amount to spend; converted to shares via price.
    */
   async placeOrder(params: PlaceOrderParams): Promise<OrderResult> {
+    console.log('[placeOrder] params:', {
+      tokenId: params.tokenId,
+      side: params.side,
+      amount: params.sizeUsd,
+      price: params.price,
+      tokenIdType: typeof params.tokenId,
+    });
+    console.log('[placeOrder] creds:', {
+      key: this.clobClient ? 'SET' : 'UNDEFINED',
+      secret: (this.clobClient as any)?._creds?.secret ? 'SET' : 'UNDEFINED',
+      passphrase: (this.clobClient as any)?._creds?.passphrase ? 'SET' : 'UNDEFINED',
+    });
+
+    if (!params.tokenId) throw new Error('tokenId is undefined');
+    if (!process.env.POLY_SECRET) throw new Error('API secret is undefined');
+    if (!process.env.POLY_PASSPHRASE) throw new Error('passphrase is undefined');
+
     const { tokenId, side, price, sizeUsd, marketId } = params;
 
     // Convert dollar amount to shares
