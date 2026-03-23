@@ -485,14 +485,13 @@ async function runStartupDiagnostic(): Promise<void> {
   // ── Markets per symbol (timestamp-based slug discovery) ───────────────────
   for (const sym of ['BTC', 'ETH', 'SOL']) {
     try {
-      const markets = await polymarket.getActiveCryptoMarkets(sym);
-      const market = markets[0] ?? null;
+      const market = await polymarket.findCurrentMarket(sym);
       if (market) {
-        const secs = polymarket.getSecondsUntilClose(market);
+        const secs = market.secondsUntilClose;
         const mins = Math.floor(secs / 60);
         const secPad = String(secs % 60).padStart(2, '0');
         lines.push(
-          `- ${sym}: ✅ ${market.slug} | UP: ${market.yesPrice.toFixed(2)} | DOWN: ${market.noPrice.toFixed(2)} | ` +
+          `- ${sym}: ✅ ${market.slug} | UP: ${market.upPrice.toFixed(2)} | DOWN: ${market.downPrice.toFixed(2)} | ` +
           `cierra en ${mins}min ${secPad}s | acepta órdenes: ${market.acceptingOrders ? '✅' : '❌'}`
         );
       } else {
@@ -534,49 +533,6 @@ async function runStartupDiagnostic(): Promise<void> {
   lines.push(allMarketsOk ? '- ✅ Listo para operar' : '- ⚠️ Revisar errores antes de operar');
 
   telegram.sendLog(lines.join('\n'));
-}
-
-// ─── Gamma API Debug ──────────────────────────────────────────────────────────
-
-async function testFetchDirect(): Promise<void> {
-  console.log('=== DIRECT FETCH TEST ===');
-  const url = 'https://gamma-api.polymarket.com/events?slug=btc-updown-5m-1774293000';
-  try {
-    const res = await fetch(url);
-    const text = await res.text();
-    console.log('Direct fetch status:', res.status);
-    console.log('Direct fetch result:', text.slice(0, 300));
-    console.log('=== END TEST ===');
-  } catch (e: any) {
-    console.log('Direct fetch FAILED:', e.message);
-  }
-}
-// Call immediately
-testFetchDirect();
-
-async function debugGammaAPI(): Promise<void> {
-  const GAMMA_BASE = 'https://gamma-api.polymarket.com';
-  const urls = [
-    `${GAMMA_BASE}/events?active=true&closed=false&limit=10`,
-    `${GAMMA_BASE}/events?limit=5`,
-    `${GAMMA_BASE}/markets?active=true&limit=5`,
-    `${GAMMA_BASE}/events?slug=btc-updown-5m-1774268100`,
-  ];
-
-  console.log('\n========== DEBUG GAMMA API ==========');
-  for (const url of urls) {
-    try {
-      const res = await fetch(url);
-      const text = await res.text();
-      console.log(`\n=== ${url} ===`);
-      console.log(`Status: ${res.status}`);
-      console.log(`Response (first 1000 chars): ${text.slice(0, 1000)}`);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.log(`\n=== ${url} === ERROR: ${msg}`);
-    }
-  }
-  console.log('\n========== END DEBUG GAMMA API ==========\n');
 }
 
 // ─── Startup ──────────────────────────────────────────────────────────────────
@@ -634,10 +590,6 @@ async function main(): Promise<void> {
 
   // Log timestamp math so we can verify ET-alignment before trusting slugs
   logTimestampVerification();
-
-  // Debug Gamma API — log raw responses to console before regular fetch
-  logger.info('[Bot] Debugging Gamma API...');
-  await debugGammaAPI();
 
   // Run startup diagnostic and send full status to Telegram
   logger.info('[Bot] Running startup diagnostic...');
