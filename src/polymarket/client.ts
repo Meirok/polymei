@@ -96,6 +96,41 @@ interface GammaMarket {
   }>;
 }
 
+// Gamma API event shape (wraps markets, returned by /events?slug=)
+interface GammaEvent {
+  id: string;
+  slug: string;
+  title?: string;
+  markets: GammaMarket[];
+}
+
+/** Structured market object returned by timestamp-based discovery. */
+export interface ActiveMarket {
+  symbol: string;
+  slug: string;
+  timestamp: number;   // Unix seconds — market close time
+  conditionId: string;
+  yesTokenId: string;
+  noTokenId: string;
+  yesPrice: number;
+  noPrice: number;
+  question: string;
+}
+
+// ─── Timestamp Helpers ────────────────────────────────────────────────────────
+
+/** Round up current time to next 5-minute boundary (the closing timestamp of
+ *  the market that is currently open). */
+export function getCurrentMarketTimestamp(): number {
+  const now = Math.floor(Date.now() / 1000);
+  return Math.ceil(now / 300) * 300;
+}
+
+/** Close timestamp of the market that opens after the current one. */
+export function getNextMarketTimestamp(): number {
+  return getCurrentMarketTimestamp() + 300;
+}
+
 // ─── PolymarketClient ─────────────────────────────────────────────────────────
 
 export class PolymarketClient {
@@ -106,6 +141,13 @@ export class PolymarketClient {
   private negRiskCache = new Map<string, boolean>();
   // conditionId → market metadata cache (60s TTL)
   private marketCache = new Map<string, { data: GammaMarket; expiresAt: number }>();
+
+  // Timestamp-based market cache: SYMBOL → ActiveMarket
+  private activeMarketsCache = new Map<string, ActiveMarket>();
+  // Last 5-min boundary timestamp seen during auto-refresh
+  private lastKnownTimestamp = 0;
+  // Auto-refresh interval handle
+  private refreshTimer: NodeJS.Timeout | null = null;
 
   // Optional callback for sending log messages to Telegram
   private logFn?: (msg: string) => void;
@@ -200,181 +242,174 @@ export class PolymarketClient {
   // ─── Market Discovery ──────────────────────────────────────────────────────
 
   /**
-   * Find active 5-minute markets for a given symbol (BTC, ETH, SOL…).
-   *
-   * Tries three approaches in order:
-   *   1. Gamma API with tag_slug=crypto, filter by symbol + 10-min expiry window
-   *   2. Gamma API without tag filter (broader search)
-   *   3. Direct CLOB API /markets endpoint as last resort
-   *
-   * Each step is logged to Telegram so we can see exactly where discovery fails.
+   * Fetch a single market from Gamma /events?slug= using the known slug pattern.
    */
-  async getActiveCryptoMarkets(symbol: string): Promise<GammaMarket[]> {
-    const now = Date.now();
-    const windowEnd = now + 10 * 60 * 1000; // 10-minute look-ahead
+  private async fetchMarketBySlug(
+    symbol: string,
+    slug: string,
+    timestamp: number
+  ): Promise<ActiveMarket | null> {
+    const url = `${GAMMA_API}/events?slug=${encodeURIComponent(slug)}`;
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      logger.debug(`[PolymarketClient] ${symbol}: /events?slug=${slug} → HTTP ${resp.status}`);
+      return null;
+    }
+
+    const raw = await resp.json();
+    const events: GammaEvent[] = Array.isArray(raw) ? raw : [raw as GammaEvent];
+    const event = events[0];
+
+    if (!event?.markets?.length) {
+      logger.debug(`[PolymarketClient] ${symbol}: no markets in event for slug ${slug}`);
+      return null;
+    }
+
+    const market = event.markets[0];
+    const yesToken = market.tokens?.find((t) => t.outcome.toLowerCase() === 'yes');
+    const noToken  = market.tokens?.find((t) => t.outcome.toLowerCase() === 'no');
+
+    if (!yesToken || !noToken) {
+      logger.debug(`[PolymarketClient] ${symbol}: YES/NO tokens not found for slug ${slug}`);
+      return null;
+    }
+
+    return {
+      symbol,
+      slug,
+      timestamp,
+      conditionId: market.conditionId,
+      yesTokenId: yesToken.token_id,
+      noTokenId: noToken.token_id,
+      yesPrice: Number(yesToken.price),
+      noPrice: Number(noToken.price),
+      question: market.question ?? slug,
+    };
+  }
+
+  /**
+   * Discover the active 5-minute market for a symbol using the timestamp-based
+   * slug: {symbol}-updown-5m-{unix_timestamp}
+   *
+   * Tries the current 5-min boundary first, then the next one.
+   * Updates the internal cache; use getActiveMarket() for fast cache reads.
+   */
+  async getActiveCryptoMarkets(symbol: string): Promise<ActiveMarket[]> {
     const sym = symbol.toUpperCase();
+    const symLower = sym.toLowerCase();
+    const timestamps = [getCurrentMarketTimestamp(), getNextMarketTimestamp()];
 
-    const filterMarkets = (all: GammaMarket[]): {
-      bySymbol: GammaMarket[];
-      byExpiry: GammaMarket[];
-    } => {
-      const bySymbol = all.filter((m) => m.question?.toUpperCase().includes(sym));
-      const byExpiry = bySymbol.filter((m) => {
-        if (!m.endDateIso) return false;
-        const exp = new Date(m.endDateIso).getTime();
-        return exp > now && exp <= windowEnd;
-      });
-      return { bySymbol, byExpiry };
-    };
-
-    const queryGamma = async (extraParams: Record<string, string>): Promise<GammaMarket[]> => {
-      const params = new URLSearchParams({
-        active: 'true',
-        closed: 'false',
-        order: 'endDateIso',
-        ascending: 'true',
-        limit: '100',
-        ...extraParams,
-      });
-      const resp = await fetch(`${GAMMA_API}/markets?${params}`);
-      if (!resp.ok) throw new Error(`Gamma ${resp.status}: ${resp.statusText}`);
-      return (await resp.json()) as GammaMarket[];
-    };
-
-    // ── Attempt 1: Gamma with crypto tag ────────────────────────────────────
-    try {
-      const all = await queryGamma({ tag_slug: 'crypto' });
-      const { bySymbol, byExpiry } = filterMarkets(all);
-
-      this.logFn?.(
-        `🔍 [${sym}] Gamma (tag=crypto): total=${all.length} | ` +
-        `con '${sym}'=${bySymbol.length} | expiran <10min=${byExpiry.length}` +
-        (byExpiry[0] ? `\n- Mejor: "${byExpiry[0].question}"` : '')
-      );
-
-      if (byExpiry.length > 0) return byExpiry;
-
-      // If tag search found symbol matches but none in window, don't try broader search
-      if (bySymbol.length > 0) {
-        this.logFn?.(
-          `⚠️ [${sym}] ${bySymbol.length} mercados encontrados pero ninguno cierra en <10min\n` +
-          `- Próximo cierre: ${bySymbol[0]?.endDateIso ?? 'desconocido'}`
-        );
+    for (const ts of timestamps) {
+      const slug = `${symLower}-updown-5m-${ts}`;
+      try {
+        const market = await this.fetchMarketBySlug(sym, slug, ts);
+        if (market) {
+          this.activeMarketsCache.set(sym, market);
+          logger.debug(`[PolymarketClient] ${sym}: cached market ${slug}`);
+          return [market];
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.debug(`[PolymarketClient] ${sym}: error fetching ${slug} — ${msg}`);
+        this.logFn?.(`⚠️ [${sym}] Error al obtener ${slug}: ${msg}`);
       }
-    } catch (err) {
-      this.logFn?.(`⚠️ [${sym}] Gamma (tag=crypto) falló: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    // ── Attempt 2: Gamma without tag (broader) ───────────────────────────────
-    try {
-      const all = await queryGamma({});
-      const { bySymbol, byExpiry } = filterMarkets(all);
-
-      this.logFn?.(
-        `🔍 [${sym}] Gamma (sin tag): total=${all.length} | ` +
-        `con '${sym}'=${bySymbol.length} | expiran <10min=${byExpiry.length}` +
-        (byExpiry[0] ? `\n- Mejor: "${byExpiry[0].question}"` : '')
-      );
-
-      if (byExpiry.length > 0) return byExpiry;
-    } catch (err) {
-      this.logFn?.(`⚠️ [${sym}] Gamma (sin tag) falló: ${err instanceof Error ? err.message : String(err)}`);
-    }
-
-    // ── Attempt 3: Direct CLOB API ───────────────────────────────────────────
-    try {
-      const resp = await fetch(`${CLOB_HOST}/markets?active=true&closed=false`);
-      if (resp.ok) {
-        const data = await resp.json() as any;
-        const raw: any[] = Array.isArray(data) ? data : (data?.data ?? data?.markets ?? []);
-
-        // Normalize CLOB market shape to GammaMarket
-        const normalized: GammaMarket[] = raw.map((m: any) => ({
-          id: m.id ?? m.condition_id ?? '',
-          conditionId: m.condition_id ?? m.conditionId ?? m.id ?? '',
-          question: m.question ?? '',
-          slug: m.slug ?? '',
-          active: true,
-          closed: false,
-          endDateIso: m.end_date_iso ?? m.endDateIso ?? m.expiration ?? '',
-          tokens: m.tokens ?? [],
-        }));
-
-        const { bySymbol, byExpiry } = filterMarkets(normalized);
-
-        this.logFn?.(
-          `🔍 [${sym}] CLOB directo: total=${raw.length} | ` +
-          `con '${sym}'=${bySymbol.length} | expiran <10min=${byExpiry.length}` +
-          (byExpiry[0] ? `\n- Mejor: "${byExpiry[0].question}"` : '')
-        );
-
-        if (byExpiry.length > 0) return byExpiry;
-      } else {
-        this.logFn?.(`⚠️ [${sym}] CLOB directo: ${resp.status} ${resp.statusText}`);
-      }
-    } catch (err) {
-      this.logFn?.(`⚠️ [${sym}] CLOB directo falló: ${err instanceof Error ? err.message : String(err)}`);
-    }
-
+    this.logFn?.(
+      `❌ No se pudo obtener mercado para ${sym}\n` +
+      `- Slugs probados: ${timestamps.map((ts) => `${symLower}-updown-5m-${ts}`).join(', ')}`
+    );
     return [];
   }
 
   /**
-   * Find the single best market for a symbol expiring in the next 5-minute window.
-   * Returns the market closest to the next 5-minute boundary.
-   * Logs to Telegram when market is found or not found.
+   * Return the cached ActiveMarket for a symbol (O(1) — no network call).
+   * Populate the cache first by calling getActiveCryptoMarkets() or startAutoRefresh().
+   */
+  getActiveMarket(symbol: string): ActiveMarket | null {
+    return this.activeMarketsCache.get(symbol.toUpperCase()) ?? null;
+  }
+
+  /**
+   * Compute the live seconds-until-close for a market (always fresh, not stale).
+   */
+  getSecondsUntilClose(market: ActiveMarket): number {
+    return Math.max(0, market.timestamp - Math.floor(Date.now() / 1000));
+  }
+
+  /**
+   * Start a background 30-second loop that detects new 5-minute windows and
+   * refreshes all markets. Sends a Telegram notification when a new window opens.
+   */
+  startAutoRefresh(symbols: string[]): void {
+    if (this.refreshTimer) return;
+
+    // Seed the initial timestamp so the first tick doesn't fire a false "new window" alert
+    this.lastKnownTimestamp = getCurrentMarketTimestamp();
+
+    const doRefresh = async () => {
+      const newTs = getCurrentMarketTimestamp();
+      if (newTs === this.lastKnownTimestamp) return; // same window, nothing to do
+      this.lastKnownTimestamp = newTs;
+
+      logger.info(`[PolymarketClient] New 5-min window: ts=${newTs}`);
+
+      const results = await Promise.all(
+        symbols.map(async (sym) => {
+          try {
+            const markets = await this.getActiveCryptoMarkets(sym);
+            const market = markets[0];
+            if (market) {
+              const secs = this.getSecondsUntilClose(market);
+              const mins = Math.floor(secs / 60);
+              const secPad = String(secs % 60).padStart(2, '0');
+              return `- ${sym}: ${market.slug} | YES: ${market.yesPrice.toFixed(2)} | Cierra en: ${mins}m ${secPad}s`;
+            }
+            return `- ${sym}: ❌ No se pudo obtener mercado`;
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return `- ${sym}: ❌ Error — ${msg}`;
+          }
+        })
+      );
+
+      this.logFn?.(['🏪 Nuevo mercado abierto', ...results].join('\n'));
+    };
+
+    this.refreshTimer = setInterval(() => {
+      doRefresh().catch((err) =>
+        logger.error('[PolymarketClient] Auto-refresh error', err)
+      );
+    }, 30_000);
+
+    logger.info('[PolymarketClient] Auto-refresh started (30s interval)');
+  }
+
+  /**
+   * Find the single best market for a symbol.
+   * Thin wrapper around getActiveCryptoMarkets() that returns a GammaMarket-shaped
+   * object for backward compatibility.
    */
   async findCurrentMarket(
     symbol: string,
-    type: 'above' | 'below' = 'above'
+    _type: 'above' | 'below' = 'above'
   ): Promise<GammaMarket | null> {
     const markets = await this.getActiveCryptoMarkets(symbol);
-
-    if (markets.length === 0) {
-      const msg =
-        `🏪 [${symbol}] Sin mercado activo en los próximos 5 min — saltando\n` +
-        `- Dirección buscada: ${type}\n` +
-        `- Gamma API devolvió 0 mercados para el símbolo`;
-      logger.debug(`[PolymarketClient] ${symbol}: no markets found on Gamma`);
-      this.logFn?.(msg);
-      return null;
-    }
-
-    const now = Date.now();
-    const keyword = type === 'above' ? 'ABOVE' : 'BELOW';
-
-    // Prefer markets that contain the directional keyword
-    const filtered = markets.filter((m) => {
-      const q = m.question.toUpperCase();
-      return q.includes(keyword) || q.includes('HIGHER') || q.includes('OVER');
-    });
-
-    const pool = filtered.length > 0 ? filtered : markets;
-
-    const market = pool
-      .filter((m) => new Date(m.endDateIso).getTime() > now)
-      .sort(
-        (a, b) =>
-          new Date(a.endDateIso).getTime() - new Date(b.endDateIso).getTime()
-      )[0] ?? null;
-
-    if (!market) {
-      const msg =
-        `🏪 [${symbol}] Sin mercado activo en los próximos 5 min — saltando\n` +
-        `- Encontrados ${markets.length} mercados pero ninguno válido para dirección '${type}'`;
-      logger.debug(`[PolymarketClient] ${symbol}: markets found but none match direction '${type}'`);
-      this.logFn?.(msg);
-      return null;
-    }
-
-    const expiresInSec = Math.round(
-      (new Date(market.endDateIso).getTime() - now) / 1000
-    );
-    logger.debug(
-      `[PolymarketClient] ${symbol}: found market '${market.question}' expiring in ${expiresInSec}s`
-    );
-
-    return market;
+    if (markets.length === 0) return null;
+    const m = markets[0];
+    return {
+      id: m.conditionId,
+      conditionId: m.conditionId,
+      question: m.question,
+      slug: m.slug,
+      active: true,
+      closed: false,
+      endDateIso: new Date(m.timestamp * 1000).toISOString(),
+      tokens: [
+        { token_id: m.yesTokenId, outcome: 'Yes', price: m.yesPrice },
+        { token_id: m.noTokenId,  outcome: 'No',  price: m.noPrice },
+      ],
+    };
   }
 
   // ─── Order Book & Odds ─────────────────────────────────────────────────────
