@@ -12,8 +12,13 @@
 import chalk from 'chalk';
 import type { BinanceFeed } from './feeds/binance.js';
 import type { RiskManager } from './risk/manager.js';
-import { secondsUntilNext5MinBoundary } from './strategies/sniper.js';
-import { SYMBOLS, DRY_RUN, SNIPE_WINDOW_START, SNIPE_WINDOW_END } from '../config.js';
+import { SYMBOLS, DRY_RUN } from '../config.js';
+
+function secondsUntilNext5MinBoundary(): number {
+  const now = Date.now();
+  const fiveMinMs = 5 * 60 * 1000;
+  return (fiveMinMs - (now % fiveMinMs)) / 1000;
+}
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 
@@ -52,8 +57,6 @@ export class Dashboard {
     const uptimeSec = Math.floor(uptimeMs / 1000);
     const uptimeStr = this.formatUptime(uptimeSec);
 
-    const isInWindow = secondsLeft <= SNIPE_WINDOW_START && secondsLeft >= SNIPE_WINDOW_END;
-
     // ── Header ───────────────────────────────────────────────────────────────
     const lines: string[] = [];
     lines.push('');
@@ -62,7 +65,7 @@ export class Dashboard {
     );
     lines.push(
       chalk.bold.cyan('║') +
-      chalk.bold.white('       POLYMARKET CRYPTO SNIPER BOT               ') +
+      chalk.bold.white('      POLYMARKET CRYPTO SCALPER BOT               ') +
       chalk.bold.cyan('║')
     );
     lines.push(
@@ -85,11 +88,7 @@ export class Dashboard {
 
     // ── Candle countdown ──────────────────────────────────────────────────────
     const candleBar = this.buildCandleBar(secondsLeft);
-    const windowLabel = isInWindow
-      ? chalk.bgYellow.black(' ⚡ SNIPE WINDOW ACTIVE ')
-      : chalk.gray(`  Next window in ${(secondsLeft - SNIPE_WINDOW_END).toFixed(0)}s`);
-
-    lines.push(`  5-min Candle: ${candleBar}  ${chalk.bold(secondsLeft.toFixed(1) + 's')}  ${windowLabel}`);
+    lines.push(`  5-min Candle: ${candleBar}  ${chalk.bold(secondsLeft.toFixed(1) + 's')}`);
     lines.push('');
 
     // ── Price table ───────────────────────────────────────────────────────────
@@ -201,9 +200,7 @@ export class Dashboard {
     const barLen = 30;
     const filledLen = Math.round((filled / total) * barLen);
     const bar = '█'.repeat(filledLen) + '░'.repeat(barLen - filledLen);
-
-    const isInWindow = secondsLeft <= SNIPE_WINDOW_START && secondsLeft >= SNIPE_WINDOW_END;
-    return isInWindow ? chalk.yellow(bar) : chalk.gray(bar);
+    return chalk.cyan(bar);
   }
 
   private buildLimitBar(fraction: number): string {

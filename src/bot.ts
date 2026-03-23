@@ -5,17 +5,17 @@
  *
  * Lifecycle:
  *   1. Initialize all modules (Binance WS, Polymarket client, Risk, Telegram)
- *   2. Start evaluation loop every 500ms
- *   3. On signal → validate risk → size position → place order → track
- *   4. On position resolution → record P&L → notify Telegram
+ *   2. On new 5-min market window → scalper.onNewMarket() buys the near-50/50 side
+ *   3. Every 2 seconds → scalper.monitorPositions() checks for target/force-sell
+ *   4. On market close → scalper.onMarketClose() + send summary to Telegram
  *   5. Graceful shutdown on SIGINT / SIGTERM
  */
 
 import 'dotenv/config';
 import readline from 'readline';
 import { BinanceFeed } from './feeds/binance.js';
-import { PolymarketClient, logTimestampVerification } from './polymarket/client.js';
-import { Sniper, secondsUntilNext5MinBoundary } from './strategies/sniper.js';
+import { PolymarketClient, logTimestampVerification, getCurrentMarketCloseTimestamp } from './polymarket/client.js';
+import { Scalper } from './strategies/scalper.js';
 import { RiskManager } from './risk/manager.js';
 import { TelegramNotifier } from './notifications/telegram.js';
 import { Dashboard } from './dashboard.js';
@@ -28,15 +28,12 @@ import {
   DRY_RUN,
   DAILY_LOSS_LIMIT_USD,
   SYMBOLS,
-  MAX_POSITION_USD,
   MAX_CONCURRENT_POSITIONS,
-  MIN_PRICE_CHANGE_PCT,
-  MIN_CONFIDENCE,
-  SNIPE_WINDOW_START,
-  SNIPE_WINDOW_END,
+  SCALPER_POSITION_SIZE_USD,
+  SCALPER_PROFIT_TARGET,
+  SCALPER_MAX_ENTRY_PRICE,
+  SCALPER_FORCE_SELL_SECONDS,
 } from '../config.js';
-import type { ManagedPosition } from './risk/manager.js';
-import type { TradeSignal } from './strategies/sniper.js';
 
 // ─── Market Window Tracking ───────────────────────────────────────────────────
 
@@ -61,14 +58,18 @@ type BotStatus = 'ACTIVE' | 'PAUSED' | 'HALTED';
 
 let botStatus: BotStatus = 'ACTIVE';
 let evalTimer: NodeJS.Timeout | null = null;
+let monitorTimer: NodeJS.Timeout | null = null;
+
+// Last known 5-min market close timestamp — used to detect new windows
+let lastMarketTimestamp = 0;
 
 // ─── Module Initialization ────────────────────────────────────────────────────
 
 const binance = new BinanceFeed(SYMBOLS);
 const polymarket = new PolymarketClient();
-const sniper = new Sniper(binance, polymarket);
 const risk = new RiskManager();
 const telegram = new TelegramNotifier();
+const scalper = new Scalper(polymarket, risk, (msg: string) => telegram.sendLog(msg));
 const dashboard = new Dashboard(binance, risk, () => botStatus);
 
 // ─── Telegram Command Handlers ─────────────────────────────────────────────
@@ -105,130 +106,13 @@ function setupTelegramCommands(): void {
   telegram.registerCommand('config', () => telegram.buildConfigMessage());
 }
 
-// ─── Position Resolution Monitor ──────────────────────────────────────────────
-
-/**
- * Check all open positions against Polymarket to see if they've resolved.
- * This is called in the evaluation loop.
- *
- * In live mode we'd query CLOB for filled/settled state.
- * In DRY_RUN mode we simulate resolution: position resolves when the
- * 5-minute candle closes, outcome = whether Binance price confirms our direction.
- */
-async function checkPositionResolution(): Promise<void> {
-  const openPositions = risk.getOpenPositions();
-  if (openPositions.length === 0) return;
-
-  const secondsLeft = secondsUntilNext5MinBoundary();
-
-  for (const position of openPositions) {
-    try {
-      if (DRY_RUN) {
-        await resolvePositionDryRun(position, secondsLeft);
-      } else {
-        await resolvePositionLive(position);
-      }
-    } catch (err) {
-      logger.error(`[Bot] Error resolving position ${position.id}`, err);
-    }
-  }
-}
-
-async function resolvePositionDryRun(
-  position: ManagedPosition,
-  secondsLeft: number
-): Promise<void> {
-  // Only resolve when candle closes (< 2s left)
-  if (secondsLeft > 2) return;
-
-  // Get final Binance price and determine if our bet was right
-  const priceState = binance.getState(position.symbol);
-  if (!priceState) return;
-
-  const priceAtResolution = priceState.currentPrice;
-  const entryPrice = priceState.candleOpen;
-  const finalChange = entryPrice > 0
-    ? ((priceAtResolution - entryPrice) / entryPrice) * 100
-    : 0;
-
-  // YES wins if price went up, NO wins if price went down
-  const won =
-    (position.side === 'YES' && finalChange > 0) ||
-    (position.side === 'NO' && finalChange < 0);
-
-  const exitPrice = won ? 0.97 : 0.03; // approximate resolution price
-  const closed = risk.closePosition(position.id, exitPrice, won);
-  if (!closed) return;
-
-  botState.pnlPeriod += closed.pnlUsd ?? 0;
-  botState.openPositions = risk.getSnapshot().openPositions;
-
-  if (won) {
-    telegram.notifyWin(closed);
-  } else {
-    telegram.notifyLoss(closed);
-  }
-
-  sniper.resetCooldown(position.symbol);
-
-  // Risk alerts
-  const snapshot = risk.getSnapshot();
-  if (snapshot.halted) {
-    const msg = `Daily loss limit hit: -$${Math.abs(snapshot.dailyPnl).toFixed(2)} / $${DAILY_LOSS_LIMIT_USD}`;
-    telegram.notifyRiskAlert(msg);
-    botStatus = 'HALTED';
-    telegram.notifyBotStopped('Daily loss limit reached');
-  } else if (snapshot.dailyLimitUsed > 0.8) {
-    telegram.notifyRiskAlert(
-      `Daily loss limit approaching: -$${Math.abs(snapshot.dailyPnl).toFixed(2)}/$${DAILY_LOSS_LIMIT_USD}`
-    );
-  }
-}
-
-async function resolvePositionLive(position: ManagedPosition): Promise<void> {
-  // Query CLOB for order status
-  const openOrders = await polymarket.getOpenOrders();
-  const isStillOpen = openOrders.some((o: any) => o.id === position.orderId);
-
-  if (isStillOpen) return; // still alive
-
-  // Order is gone — either filled+resolved or cancelled
-  // Try to determine resolution from Polymarket
-  // In the absence of a direct resolution endpoint in the CLOB client,
-  // we check if the market end time has passed
-  const now = Date.now();
-  const marketExpired = true; // simplified — real impl would check market.endDateIso
-
-  if (!marketExpired) return;
-
-  // Determine outcome from final Binance price
-  const priceState = binance.getState(position.symbol);
-  const finalChange = priceState
-    ? ((priceState.currentPrice - priceState.candleOpen) / priceState.candleOpen) * 100
-    : 0;
-
-  const won =
-    (position.side === 'YES' && finalChange > 0) ||
-    (position.side === 'NO' && finalChange < 0);
-
-  const exitPrice = won ? 0.97 : 0.03;
-  const closed = risk.closePosition(position.id, exitPrice, won);
-  if (!closed) return;
-
-  botState.pnlPeriod += closed.pnlUsd ?? 0;
-  botState.openPositions = risk.getSnapshot().openPositions;
-
-  if (won) {
-    telegram.notifyWin(closed);
-  } else {
-    telegram.notifyLoss(closed);
-  }
-
-  sniper.resetCooldown(position.symbol);
-}
-
 // ─── Evaluation Loop ──────────────────────────────────────────────────────────
 
+/**
+ * Runs every EVAL_INTERVAL_MS (500ms).
+ * Detects new 5-minute market windows and calls scalper.onNewMarket().
+ * Also sends market-close summaries when windows expire.
+ */
 async function evaluationTick(): Promise<void> {
   if (botStatus !== 'ACTIVE') return;
   if (risk.isHalted()) {
@@ -236,38 +120,59 @@ async function evaluationTick(): Promise<void> {
     return;
   }
 
-  // Check if any positions have resolved
-  await checkPositionResolution();
+  botState.openPositions = scalper.getOpenPositionsCount();
 
-  // Evaluate new signals
-  const signals = await sniper.evaluateAll();
+  // ── Detect new 5-minute market window ────────────────────────────────────
+  const currentTs = getCurrentMarketCloseTimestamp();
+  if (currentTs !== lastMarketTimestamp) {
+    lastMarketTimestamp = currentTs;
+    logger.info(`[Bot] New 5-min market window detected: ts=${currentTs}`);
 
-  for (const signal of signals) {
-    await processSignal(signal);
-  }
+    // Fetch fresh markets and trigger scalper entry for each symbol
+    for (const sym of SYMBOLS) {
+      try {
+        const market = await polymarket.findCurrentMarket(sym);
+        if (!market) {
+          logger.warn(`[Bot] No market found for ${sym} at window open`);
+          continue;
+        }
 
-  // ── Update market windows from sniper's cached market data ──────────────
-  for (const sym of SYMBOLS) {
-    const known = sniper.getLastKnownMarket(sym);
-    if (known) {
-      const existing = marketWindows.get(sym);
-      // Register new window or update if market changed
-      if (!existing || existing.expiryMs !== known.expiryMs) {
-        sniper.resetWindow(sym);
+        const expiryMs = new Date(market.endDate).getTime();
+
+        // Reset window tracking for this symbol
+        scalper.resetWindow(sym);
         marketWindows.set(sym, {
           symbol: sym,
-          question: known.question,
-          expiryMs: known.expiryMs,
+          question: market.slug,
+          expiryMs,
           betPlaced: false,
           positionId: null,
           noTradeReasons: [],
           closeSummarySent: false,
         });
+
+        // Ask scalper to open a position if conditions are met
+        await scalper.onNewMarket(sym, market);
+
+        // Capture bet info if scalper opened a position
+        const pos = scalper.getOpenPosition(sym);
+        const win = marketWindows.get(sym);
+        if (win && pos) {
+          win.betPlaced = true;
+          win.positionId = pos.riskPositionId;
+          win.side = pos.side === 'UP' ? 'YES' : 'NO';
+          win.betAmount = pos.usdInvested;
+          win.betOdds = pos.entryPrice;
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error(`[Bot] Error handling new market for ${sym}`, err);
+        telegram.notifyError('bot', msg, 'skipping symbol');
       }
     }
   }
 
-  // ── Check for market expirations and send close summaries ───────────────
+  // ── Check for market expirations → send close summaries ──────────────────
   const now = Date.now();
   for (const [sym, win] of marketWindows.entries()) {
     if (win.closeSummarySent || now < win.expiryMs) continue;
@@ -276,21 +181,8 @@ async function evaluationTick(): Promise<void> {
     const priceAtClose = priceState?.currentPrice ?? 0;
     const snapshot = risk.getSnapshot();
 
-    // Determine result if a bet was placed
-    let result: 'win' | 'loss' | 'pending' | undefined;
-    let pnlFromBet: number | undefined;
-
-    if (win.betPlaced && win.positionId) {
-      // Check if position is already closed (WIN/LOSS) or still open
-      const openPos = risk.getOpenPositions().find((p) => p.id === win.positionId);
-      if (openPos) {
-        result = 'pending';
-      } else {
-        // Closed — we can't easily recover the P&L here without adding a new
-        // method to RiskManager, so mark as pending and let win/loss notify handle it
-        result = 'pending';
-      }
-    }
+    // Notify scalper: market closed (handles any un-sold position)
+    await scalper.onMarketClose(sym, priceAtClose);
 
     const expiryDate = new Date(win.expiryMs);
     const marketTime =
@@ -299,7 +191,7 @@ async function evaluationTick(): Promise<void> {
 
     const noTradeReason = win.betPlaced
       ? undefined
-      : sniper.getSkipReason(sym);
+      : scalper.getSkipReason(sym);
 
     telegram.notifyMarketClose({
       symbol: sym,
@@ -309,98 +201,40 @@ async function evaluationTick(): Promise<void> {
       betSide: win.side,
       betAmount: win.betAmount,
       betOdds: win.betOdds,
-      result,
-      pnlFromBet,
+      result: win.betPlaced ? 'pending' : undefined,
       noTradeReason,
       priceAtClose,
       dailyPnl: snapshot.dailyPnl,
     });
 
     win.closeSummarySent = true;
-    // Clean up old windows (keep for a minute in case of late resolution)
+    // Clean up old windows after a minute
     setTimeout(() => marketWindows.delete(sym), 60_000);
   }
 }
 
-async function processSignal(signal: TradeSignal): Promise<void> {
-  logger.info(
-    `[Bot] Signal: ${signal.symbol} ${signal.action} | ` +
-    `Change: ${signal.binanceChange.toFixed(3)}% | ` +
-    `Confidence: ${signal.confidence} | ` +
-    `${signal.secondsRemaining.toFixed(0)}s left`
-  );
+// ─── Monitor Loop (every 2 seconds) ──────────────────────────────────────────
 
-  botState.signalsDetected++;
-  telegram.notifySignal(signal);
+async function monitorTick(): Promise<void> {
+  if (botStatus !== 'ACTIVE') return;
 
-  // Risk check
-  const { allowed, reason } = risk.canOpenPosition();
-  if (!allowed) {
-    logger.warn(`[Bot] Position blocked: ${reason}`);
-    botState.ordersRejected++;
-    const win = marketWindows.get(signal.symbol);
-    if (win) win.noTradeReasons.push(`riesgo bloqueado: ${reason}`);
-    return;
+  try {
+    await scalper.monitorPositions((sym) => polymarket.getActiveMarket(sym));
+    botState.openPositions = scalper.getOpenPositionsCount();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error('[Bot] Monitor tick error', err);
+    telegram.notifyError('bot', msg, 'skipping monitor cycle');
   }
 
-  // Already have a position in this market?
-  if (risk.getOpenPositionByMarket(signal.marketId)) {
-    logger.debug(`[Bot] Already have position in ${signal.marketId}`);
-    const win = marketWindows.get(signal.symbol);
-    if (win) win.noTradeReasons.push('ya hay posición en este mercado');
-    return;
+  // Check if daily limit was hit by a position close
+  if (risk.isHalted() && botStatus === 'ACTIVE') {
+    const snapshot = risk.getSnapshot();
+    const msg = `Daily loss limit hit: -$${Math.abs(snapshot.dailyPnl).toFixed(2)} / $${DAILY_LOSS_LIMIT_USD}`;
+    telegram.notifyRiskAlert(msg);
+    botStatus = 'HALTED';
+    telegram.notifyBotStopped('Daily loss limit reached');
   }
-
-  // Size the position
-  const positionUsd = risk.calcPositionSize(signal);
-  const tokenId = signal.action === 'BUY_YES' ? signal.yesTokenId : signal.noTokenId;
-  const entryPrice = signal.action === 'BUY_YES' ? signal.polyYes : signal.polyNo;
-
-  // Place order
-  const result = await polymarket.placeOrder({
-    tokenId,
-    side: 'BUY',
-    price: entryPrice,
-    sizeUsd: positionUsd,
-    marketId: signal.marketId,
-    symbol: signal.symbol,
-  });
-
-  if (!result.success) {
-    logger.error(`[Bot] Order failed: ${result.errorMsg}`);
-    const win = marketWindows.get(signal.symbol);
-    if (win) win.noTradeReasons.push(`orden fallida: ${result.errorMsg}`);
-    return;
-  }
-
-  // Register with risk manager
-  const position = risk.openPosition(
-    signal,
-    result.orderId!,
-    result.price,
-    result.sizeShares,
-    positionUsd
-  );
-
-  botState.ordersPlaced++;
-  botState.openPositions = risk.getSnapshot().openPositions;
-  telegram.notifyOrderPlaced(signal, position);
-
-  // Mark market window as bet placed
-  const win = marketWindows.get(signal.symbol);
-  if (win) {
-    win.betPlaced = true;
-    win.positionId = position.id;
-    win.side = position.side;
-    win.betAmount = positionUsd;
-    win.betOdds = result.price;
-  }
-
-  logger.info(
-    `[Bot] Order placed: ${signal.symbol} ${signal.action} ` +
-    `$${positionUsd.toFixed(2)} @ ${result.price.toFixed(3)} ` +
-    `(orderId=${result.orderId})`
-  );
 }
 
 // ─── Console Command Handler ──────────────────────────────────────────────────
@@ -456,9 +290,9 @@ function setupConsoleCommands(): void {
         case 'config':
           process.stdout.write(
             `Config — DRY_RUN: ${DRY_RUN} | SYMBOLS: ${SYMBOLS.join(',')} | ` +
-            `MAX_POSITION_USD: $${MAX_POSITION_USD} | MAX_CONCURRENT: ${MAX_CONCURRENT_POSITIONS} | ` +
-            `DAILY_LOSS_LIMIT: $${DAILY_LOSS_LIMIT_USD} | MIN_CHANGE: ${MIN_PRICE_CHANGE_PCT}% | ` +
-            `MIN_CONFIDENCE: ${MIN_CONFIDENCE} | SNIPE_WINDOW: ${SNIPE_WINDOW_START}s–${SNIPE_WINDOW_END}s | ` +
+            `POSITION_SIZE: $${SCALPER_POSITION_SIZE_USD} | MAX_CONCURRENT: ${MAX_CONCURRENT_POSITIONS} | ` +
+            `DAILY_LOSS_LIMIT: $${DAILY_LOSS_LIMIT_USD} | PROFIT_TARGET: +${SCALPER_PROFIT_TARGET} | ` +
+            `MAX_ENTRY: ${SCALPER_MAX_ENTRY_PRICE} | FORCE_SELL: ${SCALPER_FORCE_SELL_SECONDS}s | ` +
             `EVAL: ${EVAL_INTERVAL_MS}ms | DASHBOARD: ${DASHBOARD_INTERVAL_MS}ms\n`
           );
           break;
@@ -483,7 +317,7 @@ async function runStartupDiagnostic(): Promise<void> {
   const lines: string[] = ['🔧 DIAGNÓSTICO'];
   let allMarketsOk = true;
 
-  // ── Markets per symbol (timestamp-based slug discovery) ───────────────────
+  // ── Markets per symbol ────────────────────────────────────────────────────
   for (const sym of ['BTC', 'ETH', 'SOL']) {
     try {
       const market = await polymarket.findCurrentMarket(sym);
@@ -540,7 +374,7 @@ async function runStartupDiagnostic(): Promise<void> {
 
 async function main(): Promise<void> {
   const modeStr = DRY_RUN ? 'DRY RUN' : 'LIVE';
-  logger.info(`[Bot] Starting Polymarket Sniper — mode: ${modeStr}`);
+  logger.info(`[Bot] Starting Polymarket Scalper — mode: ${modeStr}`);
   logger.info(`[Bot] Symbols: ${SYMBOLS.join(', ')}`);
 
   // Initialize Polymarket client
@@ -562,10 +396,9 @@ async function main(): Promise<void> {
   setupTelegramCommands();
   telegram.initialize();
 
-  // Wire up Telegram log callbacks for diagnostics
+  // Wire up Telegram log callback for polymarket diagnostics
   const logFn = (msg: string) => telegram.sendLog(msg);
   polymarket.setLogFn(logFn);
-  sniper.setLogFn(logFn);
 
   telegram.notifyBotStarted();
 
@@ -589,17 +422,20 @@ async function main(): Promise<void> {
   logger.info('[Bot] Waiting 3s for initial price data...');
   await sleep(3000);
 
-  // Log timestamp math so we can verify ET-alignment before trusting slugs
+  // Log timestamp math so we can verify ET-alignment
   logTimestampVerification();
 
-  // Run startup diagnostic and send full status to Telegram
+  // Run startup diagnostic and send to Telegram
   logger.info('[Bot] Running startup diagnostic...');
   await runStartupDiagnostic();
 
-  // Start auto-refresh of markets every 30s (detects new 5-min windows)
+  // Seed lastMarketTimestamp so the first tick doesn't fire a spurious "new window"
+  lastMarketTimestamp = getCurrentMarketCloseTimestamp();
+
+  // Start auto-refresh of markets every 30s (keeps cache fresh for monitoring)
   polymarket.startAutoRefresh(SYMBOLS);
 
-  // Start evaluation loop
+  // Start evaluation loop (new window detection + market close summaries)
   logger.info(`[Bot] Starting evaluation loop (every ${EVAL_INTERVAL_MS}ms)`);
   evalTimer = setInterval(async () => {
     try {
@@ -610,6 +446,16 @@ async function main(): Promise<void> {
       telegram.notifyError('bot', msg, 'skipping cycle');
     }
   }, EVAL_INTERVAL_MS);
+
+  // Start position monitoring loop (checks target/force-sell every 2s)
+  logger.info('[Bot] Starting position monitor loop (every 2000ms)');
+  monitorTimer = setInterval(async () => {
+    try {
+      await monitorTick();
+    } catch (err) {
+      logger.error('[Bot] Monitor timer error', err);
+    }
+  }, 2000);
 
   // Start dashboard
   dashboard.start(DASHBOARD_INTERVAL_MS);
@@ -642,6 +488,7 @@ async function gracefulShutdown(reason = 'SIGINT'): Promise<void> {
   logger.info(`[Bot] Shutting down: ${reason}`);
 
   if (evalTimer) clearInterval(evalTimer);
+  if (monitorTimer) clearInterval(monitorTimer);
   dashboard.stop();
   binance.disconnect();
   telegram.shutdown();

@@ -11,14 +11,21 @@
  */
 
 import {
-  MAX_POSITION_USD,
   MAX_CONCURRENT_POSITIONS,
   DAILY_LOSS_LIMIT_USD,
 } from '../../config.js';
 import { logger } from '../utils/logger.js';
-import type { TradeSignal } from '../strategies/sniper.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
+
+/** Parameters required to open a new managed position. */
+export interface PositionOpenParams {
+  symbol: string;
+  side: 'YES' | 'NO';
+  tokenId: string;
+  marketId: string;
+  question: string;
+}
 
 export type PositionStatus = 'OPEN' | 'WIN' | 'LOSS' | 'CANCELLED';
 
@@ -79,7 +86,7 @@ export class RiskManager {
   // ─── Gate Checks ──────────────────────────────────────────────────────────
 
   /**
-   * Returns true if we're allowed to open a new position.
+   * Returns whether we're allowed to open a new position.
    * Checks: halt flag, daily loss limit, concurrent position cap.
    */
   canOpenPosition(): { allowed: boolean; reason?: string } {
@@ -107,58 +114,24 @@ export class RiskManager {
     return { allowed: true };
   }
 
-  /**
-   * Kelly criterion position sizing.
-   *
-   * Kelly formula: f = (b*p - q) / b
-   *   b = net odds (how much we win per dollar risked = (1 - entryPrice) / entryPrice)
-   *   p = estimated win probability (derived from confidence + entry price)
-   *   q = 1 - p
-   *
-   * We cap at MAX_POSITION_USD and use a fractional Kelly (0.25x) to be conservative.
-   */
-  calcPositionSize(signal: TradeSignal): number {
-    const confidence = signal.confidence / 100;
-    const entryPrice = signal.action === 'BUY_YES' ? signal.polyYes : signal.polyNo;
-
-    // Estimated win probability from confidence score
-    const p = 0.5 + confidence * 0.4; // maps 0→0.5, 1→0.9
-    const q = 1 - p;
-
-    // Net odds: if we buy at 0.70 and win, we get $1 back → net = 0.30 / 0.70
-    const b = (1 - entryPrice) / entryPrice;
-
-    // Kelly fraction
-    const kelly = (b * p - q) / b;
-    const fractionalKelly = Math.max(kelly * 0.25, 0); // 1/4 Kelly
-
-    // Scale to max position
-    const positionUsd = Math.min(fractionalKelly * MAX_POSITION_USD * 4, MAX_POSITION_USD);
-
-    // Ensure minimum viable order ($1 minimum on Polymarket)
-    return Math.max(positionUsd, 1);
-  }
-
   // ─── Position Lifecycle ───────────────────────────────────────────────────
 
   openPosition(
-    signal: TradeSignal,
+    params: PositionOpenParams,
     orderId: string,
     entryPrice: number,
     sizeShares: number,
     costUsd: number
   ): ManagedPosition {
     const id = `pos-${++this.positionCounter}-${Date.now()}`;
-    const side = signal.action === 'BUY_YES' ? 'YES' : 'NO';
-    const tokenId = signal.action === 'BUY_YES' ? signal.yesTokenId : signal.noTokenId;
 
     const position: ManagedPosition = {
       id,
-      symbol: signal.symbol,
-      side,
-      tokenId,
-      marketId: signal.marketId,
-      question: signal.question,
+      symbol: params.symbol,
+      side: params.side,
+      tokenId: params.tokenId,
+      marketId: params.marketId,
+      question: params.question,
       orderId,
       entryPrice,
       sizeShares,
@@ -168,7 +141,7 @@ export class RiskManager {
     };
 
     this.openPositions.set(id, position);
-    logger.info(`[RiskManager] Position opened: ${id} — ${signal.symbol} ${side} $${costUsd.toFixed(2)}`);
+    logger.info(`[RiskManager] Position opened: ${id} — ${params.symbol} ${params.side} $${costUsd.toFixed(2)}`);
     return position;
   }
 

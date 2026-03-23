@@ -33,15 +33,15 @@ export const SYMBOLS: string[] = optionalEnv('SYMBOLS', 'BTC,ETH,SOL')
   .map((s) => s.trim().toUpperCase())
   .filter(Boolean);
 
-// ─── Sniper windows ──────────────────────────────────────────────────────────
-/** Seconds before 5-min candle end to START looking for entries */
-export const SNIPE_WINDOW_START = parseInt(optionalEnv('SNIPE_WINDOW_START', '120'), 10);
-/** Seconds before 5-min candle end to STOP entering (avoid settlement lag) */
-export const SNIPE_WINDOW_END = parseInt(optionalEnv('SNIPE_WINDOW_END', '3'), 10);
-/** Minimum % price move from candle open to trigger signal */
-export const MIN_PRICE_CHANGE_PCT = parseFloat(optionalEnv('MIN_PRICE_CHANGE_PCT', '0.1'));
-/** Minimum confidence score (0-100) before placing order */
-export const MIN_CONFIDENCE = parseInt(optionalEnv('MIN_CONFIDENCE', '40'), 10);
+// ─── Scalper ──────────────────────────────────────────────────────────────────
+/** Sell when price rises this much from entry */
+export const SCALPER_PROFIT_TARGET = parseFloat(optionalEnv('SCALPER_PROFIT_TARGET', '0.05'));
+/** Only enter if odds are at or below this (near 50/50) */
+export const SCALPER_MAX_ENTRY_PRICE = parseFloat(optionalEnv('SCALPER_MAX_ENTRY_PRICE', '0.52'));
+/** Force sell when this many seconds remain in the market */
+export const SCALPER_FORCE_SELL_SECONDS = parseInt(optionalEnv('SCALPER_FORCE_SELL_SECONDS', '30'), 10);
+/** Fixed position size in USD per market */
+export const SCALPER_POSITION_SIZE_USD = parseFloat(optionalEnv('SCALPER_POSITION_SIZE_USD', '5'));
 
 // ─── Risk ────────────────────────────────────────────────────────────────────
 export const MAX_POSITION_USD = parseFloat(optionalEnv('MAX_POSITION_USD', '10'));
