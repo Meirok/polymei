@@ -139,6 +139,7 @@ export function logTimestampVerification(): void {
 export class PolymarketClient {
   private clobClient: ClobClient | null = null;
   private wallet: Wallet | null = null;
+  private signingAddress: string | null = null;
   private initialized = false;
   private tickSizeCache = new Map<string, string>();
   private negRiskCache = new Map<string, boolean>();
@@ -169,13 +170,15 @@ export class PolymarketClient {
     }
 
     this.wallet = new Wallet(POLYMARKET_PRIVATE_KEY);
-    logger.info(`[PolymarketClient] Wallet address: ${this.wallet.address}`);
+    this.signingAddress = process.env.POLY_ADDRESS ?? this.wallet.address;
+    logger.info(`[PolymarketClient] Signing address: ${this.signingAddress}`);
 
-    // L1 auth
-    this.clobClient = new ClobClient(CLOB_HOST, POLYGON_CHAIN_ID as Chain, this.wallet);
-
-    // Derive or create L2 API key
-    const creds = await this.deriveOrCreateApiKey();
+    // L2 credentials loaded directly from env
+    const creds = {
+      key: process.env.POLY_API_KEY!,
+      secret: process.env.POLY_SECRET!,
+      passphrase: process.env.POLY_PASSPHRASE!,
+    };
 
     // L2 auth
     this.clobClient = new ClobClient(CLOB_HOST, POLYGON_CHAIN_ID as Chain, this.wallet, {
@@ -188,14 +191,6 @@ export class PolymarketClient {
     logger.info('[PolymarketClient] Initialized');
   }
 
-  private async deriveOrCreateApiKey(): Promise<{ key: string; secret: string; passphrase: string }> {
-    const derived = await this.clobClient!.deriveApiKey();
-    if (derived?.key) return derived;
-    const created = await this.clobClient!.createApiKey();
-    if (!created?.key) throw new Error('Could not derive or create Polymarket API key');
-    return created;
-  }
-
   private ensureClient(): ClobClient {
     if (!this.clobClient) throw new Error('PolymarketClient not initialized');
     return this.clobClient;
@@ -204,7 +199,7 @@ export class PolymarketClient {
   // ─── Wallet / Balance ─────────────────────────────────────────────────────
 
   getWalletAddress(): string | null {
-    return this.wallet?.address ?? null;
+    return this.signingAddress ?? this.wallet?.address ?? null;
   }
 
   // ─── Market Discovery ──────────────────────────────────────────────────────
