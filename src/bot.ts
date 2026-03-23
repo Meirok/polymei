@@ -380,17 +380,26 @@ async function main(): Promise<void> {
   try {
     await polymarket.initialize();
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     if (!DRY_RUN) {
       logger.error('[Bot] Failed to initialize Polymarket client', err);
+      telegram.notifyError('polymarket', msg, 'stopping');
       process.exit(1);
     } else {
       logger.warn('[Bot] Polymarket init failed but DRY_RUN=true, continuing');
+      telegram.notifyError('polymarket', msg, 'continuing in DRY RUN');
     }
   }
 
   // Set up Telegram
   setupTelegramCommands();
   telegram.initialize();
+
+  // Wire up Telegram log callbacks for diagnostics
+  const logFn = (msg: string) => telegram.sendLog(msg);
+  polymarket.setLogFn(logFn);
+  sniper.setLogFn(logFn);
+
   telegram.notifyBotStarted();
   telegram.sendFiveMinuteSummary();
 
@@ -401,6 +410,7 @@ async function main(): Promise<void> {
   });
   binance.on('error', (err: Error) => {
     logger.error('[Bot] Binance feed error', err);
+    telegram.notifyError('binance', err.message, 'reconnecting');
   });
   binance.on('update', (ps: PriceState) => {
     const sym = ps.symbol as keyof typeof botState.currentPrices;
@@ -419,7 +429,9 @@ async function main(): Promise<void> {
     try {
       await evaluationTick();
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
       logger.error('[Bot] Evaluation tick error', err);
+      telegram.notifyError('bot', msg, 'skipping cycle');
     }
   }, EVAL_INTERVAL_MS);
 

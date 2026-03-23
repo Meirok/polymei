@@ -35,13 +35,13 @@ export const SYMBOLS: string[] = optionalEnv('SYMBOLS', 'BTC,ETH,SOL')
 
 // ─── Sniper windows ──────────────────────────────────────────────────────────
 /** Seconds before 5-min candle end to START looking for entries */
-export const SNIPE_WINDOW_START = parseInt(optionalEnv('SNIPE_WINDOW_START', '45'), 10);
+export const SNIPE_WINDOW_START = parseInt(optionalEnv('SNIPE_WINDOW_START', '120'), 10);
 /** Seconds before 5-min candle end to STOP entering (avoid settlement lag) */
-export const SNIPE_WINDOW_END = parseInt(optionalEnv('SNIPE_WINDOW_END', '5'), 10);
+export const SNIPE_WINDOW_END = parseInt(optionalEnv('SNIPE_WINDOW_END', '3'), 10);
 /** Minimum % price move from candle open to trigger signal */
-export const MIN_PRICE_CHANGE_PCT = parseFloat(optionalEnv('MIN_PRICE_CHANGE_PCT', '0.3'));
+export const MIN_PRICE_CHANGE_PCT = parseFloat(optionalEnv('MIN_PRICE_CHANGE_PCT', '0.1'));
 /** Minimum confidence score (0-100) before placing order */
-export const MIN_CONFIDENCE = parseInt(optionalEnv('MIN_CONFIDENCE', '65'), 10);
+export const MIN_CONFIDENCE = parseInt(optionalEnv('MIN_CONFIDENCE', '40'), 10);
 
 // ─── Risk ────────────────────────────────────────────────────────────────────
 export const MAX_POSITION_USD = parseFloat(optionalEnv('MAX_POSITION_USD', '10'));

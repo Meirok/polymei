@@ -107,6 +107,14 @@ export class PolymarketClient {
   // conditionId → market metadata cache (60s TTL)
   private marketCache = new Map<string, { data: GammaMarket; expiresAt: number }>();
 
+  // Optional callback for sending log messages to Telegram
+  private logFn?: (msg: string) => void;
+
+  /** Set a callback for sending diagnostic messages to Telegram */
+  setLogFn(fn: (msg: string) => void): void {
+    this.logFn = fn;
+  }
+
   async initialize(): Promise<void> {
     if (this.initialized) return;
 
@@ -176,7 +184,11 @@ export class PolymarketClient {
 
       const url = `${GAMMA_API}/markets?${params}`;
       const resp = await fetch(url);
-      if (!resp.ok) throw new Error(`Gamma API ${resp.status}: ${resp.statusText}`);
+      if (!resp.ok) {
+        const errMsg = `Gamma API ${resp.status}: ${resp.statusText}`;
+        this.logFn?.(`⚠️ ERROR: polymarket\n- Módulo: polymarket\n- Detalle: ${errMsg}\n- Acción: skipping cycle`);
+        throw new Error(errMsg);
+      }
       const markets = await resp.json() as GammaMarket[];
 
       // Filter: must mention the symbol and expire within the next 15 minutes
@@ -197,13 +209,23 @@ export class PolymarketClient {
   /**
    * Find the single best market for a symbol expiring in the next 5-minute window.
    * Returns the market closest to the next 5-minute boundary.
+   * Logs to Telegram when market is found or not found.
    */
   async findCurrentMarket(
     symbol: string,
     type: 'above' | 'below' = 'above'
   ): Promise<GammaMarket | null> {
     const markets = await this.getActiveCryptoMarkets(symbol);
-    if (markets.length === 0) return null;
+
+    if (markets.length === 0) {
+      const msg =
+        `🏪 [${symbol}] Sin mercado activo en los próximos 5 min — saltando\n` +
+        `- Dirección buscada: ${type}\n` +
+        `- Gamma API devolvió 0 mercados para el símbolo`;
+      logger.debug(`[PolymarketClient] ${symbol}: no markets found on Gamma`);
+      this.logFn?.(msg);
+      return null;
+    }
 
     const now = Date.now();
     const keyword = type === 'above' ? 'ABOVE' : 'BELOW';
@@ -216,13 +238,30 @@ export class PolymarketClient {
 
     const pool = filtered.length > 0 ? filtered : markets;
 
-    // Return the one expiring soonest (but not in the past)
-    return pool
+    const market = pool
       .filter((m) => new Date(m.endDateIso).getTime() > now)
       .sort(
         (a, b) =>
           new Date(a.endDateIso).getTime() - new Date(b.endDateIso).getTime()
       )[0] ?? null;
+
+    if (!market) {
+      const msg =
+        `🏪 [${symbol}] Sin mercado activo en los próximos 5 min — saltando\n` +
+        `- Encontrados ${markets.length} mercados pero ninguno válido para dirección '${type}'`;
+      logger.debug(`[PolymarketClient] ${symbol}: markets found but none match direction '${type}'`);
+      this.logFn?.(msg);
+      return null;
+    }
+
+    const expiresInSec = Math.round(
+      (new Date(market.endDateIso).getTime() - now) / 1000
+    );
+    logger.debug(
+      `[PolymarketClient] ${symbol}: found market '${market.question}' expiring in ${expiresInSec}s`
+    );
+
+    return market;
   }
 
   // ─── Order Book & Odds ─────────────────────────────────────────────────────
@@ -230,6 +269,7 @@ export class PolymarketClient {
   /**
    * Get YES/NO odds for a market from the CLOB order book.
    * Falls back to Gamma token prices if CLOB unavailable.
+   * Logs a warning to Telegram if liquidity is too low.
    */
   async getPolymarketOdds(market: GammaMarket): Promise<PolymarketOdds | null> {
     try {
@@ -248,6 +288,23 @@ export class PolymarketClient {
 
           const yesBestAsk = yesBook?.asks?.[0]?.price ?? yesToken.price;
           const noBestAsk = noBook?.asks?.[0]?.price ?? noToken.price;
+
+          // Check liquidity: warn if order book is empty or very thin
+          const yesAskSize = Number(yesBook?.asks?.[0]?.size ?? 0);
+          const noAskSize = Number(noBook?.asks?.[0]?.size ?? 0);
+          const MIN_LIQUIDITY_SHARES = 10; // minimum shares in best ask
+
+          if (yesAskSize < MIN_LIQUIDITY_SHARES || noAskSize < MIN_LIQUIDITY_SHARES) {
+            const lowSide = yesAskSize < MIN_LIQUIDITY_SHARES ? `YES (${yesAskSize} shares)` : `NO (${noAskSize} shares)`;
+            logger.debug(
+              `[PolymarketClient] Low liquidity on '${market.question}': ${lowSide}`
+            );
+            this.logFn?.(
+              `🏪 Liquidez baja en '${market.question}'\n` +
+              `- ${lowSide} en mejor ask\n` +
+              `- Mínimo requerido: ${MIN_LIQUIDITY_SHARES} shares`
+            );
+          }
 
           return {
             yes: Number(yesBestAsk),
@@ -352,6 +409,16 @@ export class PolymarketClient {
         result.success === true ||
         (result.orderID !== undefined && result.orderID !== '');
 
+      if (!success) {
+        const errMsg = result.errorMsg ?? 'unknown error';
+        this.logFn?.(
+          `⚠️ ERROR: polymarket\n` +
+          `- Módulo: polymarket\n` +
+          `- Detalle: Order rejected — ${errMsg}\n` +
+          `- Acción: skipping trade`
+        );
+      }
+
       return {
         success,
         orderId: result.orderID,
@@ -362,6 +429,12 @@ export class PolymarketClient {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       logger.error('[PolymarketClient] placeOrder error', { msg });
+      this.logFn?.(
+        `⚠️ ERROR: polymarket\n` +
+        `- Módulo: polymarket\n` +
+        `- Detalle: placeOrder failed — ${msg}\n` +
+        `- Acción: skipping trade`
+      );
       return { success: false, price: effectivePrice, sizeShares: effectiveSize, errorMsg: msg };
     }
   }
