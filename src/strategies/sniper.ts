@@ -12,7 +12,7 @@
  */
 
 import type { BinanceFeed } from '../feeds/binance.js';
-import type { PolymarketClient, PolymarketOdds } from '../polymarket/client.js';
+import type { PolymarketClient, ActiveMarket } from '../polymarket/client.js';
 import {
   SNIPE_WINDOW_START,
   SNIPE_WINDOW_END,
@@ -139,7 +139,7 @@ export class Sniper {
   private readonly DEBUG_LOG_INTERVAL_MS = 30_000;
 
   // Cache the last known market found per symbol (for debug logging + bot.ts tracking)
-  private lastKnownMarket: Map<string, { question: string; expiryMs: number } | null> = new Map();
+  private lastKnownMarket: Map<string, ActiveMarket | null> = new Map();
 
   // Optional callback for sending log messages to Telegram
   private logFn?: (msg: string) => void;
@@ -151,7 +151,9 @@ export class Sniper {
 
   /** Return the last market found for a symbol (used by bot.ts for market window tracking) */
   getLastKnownMarket(symbol: string): { question: string; expiryMs: number } | null {
-    return this.lastKnownMarket.get(symbol) ?? null;
+    const m = this.lastKnownMarket.get(symbol) ?? null;
+    if (!m) return null;
+    return { question: m.question, expiryMs: m.timestamp * 1000 };
   }
 
   /** Set a callback for sending diagnostic messages to Telegram */
@@ -164,9 +166,13 @@ export class Sniper {
    * Returns a TradeSignal if conditions are met, null otherwise.
    */
   async evaluateTrade(symbol: string): Promise<TradeSignal | null> {
-    const secondsRemaining = secondsUntilNext5MinBoundary();
+    // ── 1. Get current market from cache (O(1) — no network call) ────────────
+    const market = this.polymarket.getActiveMarket(symbol);
+    const secondsRemaining = market
+      ? this.polymarket.getSecondsUntilClose(market)
+      : secondsUntilNext5MinBoundary(); // fallback for debug when cache is empty
 
-    // ── Always log current state to console (every evaluation cycle) ─────────
+    // ── Always log current state to console ───────────────────────────────────
     const priceStateEarly = this.binance.getState(symbol);
     const changeEarly = priceStateEarly?.changePercent ?? 0;
     const momentumEarly = priceStateEarly?.momentum ?? 0;
@@ -187,10 +193,6 @@ export class Sniper {
         this.lastDebugLog.set(symbol, Date.now());
         const inWindow = secondsRemaining <= SNIPE_WINDOW_START && secondsRemaining >= SNIPE_WINDOW_END;
         const moveOk = Math.abs(changeEarly) >= MIN_PRICE_CHANGE_PCT;
-        const cachedMarket = this.lastKnownMarket.get(symbol);
-        const marketFound = cachedMarket !== null && cachedMarket !== undefined;
-
-        // Estimate confidence for debug (without calling Polymarket API)
         const direction = changeEarly > 0 ? 'BUY_YES' : 'BUY_NO';
         const approxConf = moveOk
           ? calculateConfidence(changeEarly, momentumEarly, 0.7, secondsRemaining, direction)
@@ -202,7 +204,7 @@ export class Sniper {
           `- ${symbol}: $${priceEarly > 0 ? priceEarly.toLocaleString('en-US') : 'N/A'} | ` +
           `cambio vela: ${changeEarly >= 0 ? '+' : ''}${changeEarly.toFixed(2)}% | ` +
           `segundos restantes: ${secondsRemaining.toFixed(0)}s\n` +
-          `- Mercado encontrado: ${marketFound ? `✅ "${cachedMarket!.question.slice(0, 40)}…"` : '❌'}\n` +
+          `- Mercado: ${market ? `✅ ${market.slug}` : '❌ sin caché'}\n` +
           `- Condición tiempo: ${inWindow ? '✅' : '❌'} (necesita <${SNIPE_WINDOW_START}s, actual: ${secondsRemaining.toFixed(0)}s)\n` +
           `- Condición movimiento: ${moveOk ? '✅' : '❌'} (necesita >${MIN_PRICE_CHANGE_PCT}%, actual: ${changeEarly >= 0 ? '+' : ''}${changeEarly.toFixed(2)}%)\n` +
           `- Condición confianza: ${confOk ? `✅ (aprox ${approxConf})` : `❌ (aprox ${approxConf} < ${MIN_CONFIDENCE})`}`
@@ -210,7 +212,16 @@ export class Sniper {
       }
     }
 
-    // ── 1. Time window check ─────────────────────────────────────────────────
+    // ── Market check ─────────────────────────────────────────────────────────
+    if (!market) {
+      logger.debug(`[Sniper:${symbol}] SKIP — sin mercado en caché (esperando auto-refresh)`);
+      return null;
+    }
+
+    // Update last known market for bot.ts market window tracking
+    this.lastKnownMarket.set(symbol, market);
+
+    // ── 2. Time window check ─────────────────────────────────────────────────
     if (secondsRemaining > SNIPE_WINDOW_START || secondsRemaining < SNIPE_WINDOW_END) {
       logger.debug(
         `[Sniper:${symbol}] SKIP — fuera de ventana ` +
@@ -219,7 +230,7 @@ export class Sniper {
       return null;
     }
 
-    // ── 2. Cooldown check ────────────────────────────────────────────────────
+    // ── 3. Cooldown check ────────────────────────────────────────────────────
     const lastSignal = this.lastSignalTime.get(symbol) ?? 0;
     const msSinceLast = Date.now() - lastSignal;
     if (msSinceLast < this.SIGNAL_COOLDOWN_MS) {
@@ -230,7 +241,7 @@ export class Sniper {
       return null;
     }
 
-    // ── 3. Price state check ─────────────────────────────────────────────────
+    // ── 4. Price state check ─────────────────────────────────────────────────
     const priceState = this.binance.getState(symbol);
     if (!priceState || priceState.currentPrice === 0) {
       logger.debug(`[Sniper:${symbol}] SKIP — sin datos de precio Binance`);
@@ -240,7 +251,7 @@ export class Sniper {
     const change = priceState.changePercent;
     const momentum = priceState.momentum;
 
-    // ── 4. Direction check ───────────────────────────────────────────────────
+    // ── 5. Direction check ───────────────────────────────────────────────────
     const isLong  = change > MIN_PRICE_CHANGE_PCT && momentum >= 0;
     const isShort = change < -MIN_PRICE_CHANGE_PCT && momentum <= 0;
 
@@ -253,93 +264,58 @@ export class Sniper {
       return null;
     }
 
-    const direction = isLong ? 'LONG (YES)' : 'SHORT (NO)';
     logger.debug(
-      `[Sniper:${symbol}] Evaluando señal ${direction} ` +
+      `[Sniper:${symbol}] Evaluando señal ${isLong ? 'LONG (YES)' : 'SHORT (NO)'} ` +
       `| cambio=${change >= 0 ? '+' : ''}${change.toFixed(3)}% ` +
       `| ${secondsRemaining.toFixed(1)}s restantes`
     );
 
-    // ── 5. Polymarket market discovery ───────────────────────────────────────
-    const market = await this.polymarket.findCurrentMarket(
-      symbol,
-      isLong ? 'above' : 'below'
-    );
-    if (!market) {
-      // "no market" is already logged to Telegram by PolymarketClient.findCurrentMarket
-      this.lastKnownMarket.set(symbol, null);
-      logger.debug(`[Sniper:${symbol}] SKIP — sin mercado Polymarket`);
-      return null;
-    }
-
-    // Cache this market for debug logging and bot.ts market window tracking
-    this.lastKnownMarket.set(symbol, {
-      question: market.question,
-      expiryMs: new Date(market.endDateIso).getTime(),
-    });
-
-    // ── 6. Get Polymarket odds ────────────────────────────────────────────────
-    const odds = await this.polymarket.getPolymarketOdds(market);
-    if (!odds) {
-      logger.debug(`[Sniper:${symbol}] SKIP — no se pudo obtener odds de Polymarket`);
-      return null;
-    }
-
-    const expiresInSec = Math.round(
-      (new Date(market.endDateIso).getTime() - Date.now()) / 1000
-    );
-
     this.logFn?.(
-      `🏪 [${symbol}] Mercado encontrado: '${market.question}'\n` +
-      `- YES: ${odds.yes.toFixed(3)} | NO: ${odds.no.toFixed(3)}\n` +
-      `- Vence en: ${expiresInSec}s`
+      `🏪 [${symbol}] Mercado: ${market.slug}\n` +
+      `- YES: ${market.yesPrice.toFixed(3)} | NO: ${market.noPrice.toFixed(3)}\n` +
+      `- Vence en: ${secondsRemaining.toFixed(0)}s`
     );
 
-    logger.debug(
-      `[Sniper:${symbol}] Odds — YES: ${odds.yes.toFixed(3)}, NO: ${odds.no.toFixed(3)} | ` +
-      `mercado: ${market.question}`
-    );
-
-    // ── 7. Entry price check ─────────────────────────────────────────────────
+    // ── 6. Entry price check ─────────────────────────────────────────────────
     const MAX_ENTRY_PRICE = 0.82;
     let action: TradeAction;
     let polyPrice: number;
 
     if (isLong) {
-      if (odds.yes >= MAX_ENTRY_PRICE) {
+      if (market.yesPrice >= MAX_ENTRY_PRICE) {
         logger.debug(
-          `[Sniper:${symbol}] SKIP — YES ya priceado en ${odds.yes.toFixed(3)} ≥ ${MAX_ENTRY_PRICE}`
+          `[Sniper:${symbol}] SKIP — YES ya priceado en ${market.yesPrice.toFixed(3)} ≥ ${MAX_ENTRY_PRICE}`
         );
         this.logFn?.(
           `🔍 [${symbol}] Señal evaluada\n` +
           `- Cambio vela: ${change >= 0 ? '+' : ''}${change.toFixed(3)}%\n` +
           `- Segundos restantes: ${secondsRemaining.toFixed(0)}s\n` +
-          `- Odds YES: ${odds.yes.toFixed(3)}\n` +
+          `- Odds YES: ${market.yesPrice.toFixed(3)}\n` +
           `- Resultado: ❌ Rechazada (YES ya priceado ≥ ${MAX_ENTRY_PRICE})`
         );
         return null;
       }
       action = 'BUY_YES';
-      polyPrice = odds.yes;
+      polyPrice = market.yesPrice;
     } else {
-      if (odds.no >= MAX_ENTRY_PRICE) {
+      if (market.noPrice >= MAX_ENTRY_PRICE) {
         logger.debug(
-          `[Sniper:${symbol}] SKIP — NO ya priceado en ${odds.no.toFixed(3)} ≥ ${MAX_ENTRY_PRICE}`
+          `[Sniper:${symbol}] SKIP — NO ya priceado en ${market.noPrice.toFixed(3)} ≥ ${MAX_ENTRY_PRICE}`
         );
         this.logFn?.(
           `🔍 [${symbol}] Señal evaluada\n` +
           `- Cambio vela: ${change >= 0 ? '+' : ''}${change.toFixed(3)}%\n` +
           `- Segundos restantes: ${secondsRemaining.toFixed(0)}s\n` +
-          `- Odds NO: ${odds.no.toFixed(3)}\n` +
+          `- Odds NO: ${market.noPrice.toFixed(3)}\n` +
           `- Resultado: ❌ Rechazada (NO ya priceado ≥ ${MAX_ENTRY_PRICE})`
         );
         return null;
       }
       action = 'BUY_NO';
-      polyPrice = odds.no;
+      polyPrice = market.noPrice;
     }
 
-    // ── 8. Confidence scoring ─────────────────────────────────────────────────
+    // ── 7. Confidence scoring ─────────────────────────────────────────────────
     const confidence = calculateConfidence(
       change,
       momentum,
@@ -354,9 +330,7 @@ export class Sniper {
     );
 
     if (confidence < MIN_CONFIDENCE) {
-      logger.debug(
-        `[Sniper:${symbol}] SKIP — confianza ${confidence} < ${MIN_CONFIDENCE}`
-      );
+      logger.debug(`[Sniper:${symbol}] SKIP — confianza ${confidence} < ${MIN_CONFIDENCE}`);
       this.logFn?.(
         `🔍 [${symbol}] Señal evaluada\n` +
         `- Cambio vela: ${change >= 0 ? '+' : ''}${change.toFixed(3)}%\n` +
@@ -368,7 +342,7 @@ export class Sniper {
       return null;
     }
 
-    // ── 9. Signal accepted ────────────────────────────────────────────────────
+    // ── 8. Signal accepted ────────────────────────────────────────────────────
     this.logFn?.(
       `🔍 [${symbol}] Señal evaluada\n` +
       `- Cambio vela: ${change >= 0 ? '+' : ''}${change.toFixed(3)}%\n` +
@@ -378,7 +352,6 @@ export class Sniper {
       `- Resultado: ✅ Aceptada`
     );
 
-    // Mark cooldown
     this.lastSignalTime.set(symbol, Date.now());
 
     return {
@@ -387,12 +360,12 @@ export class Sniper {
       confidence,
       binanceChange: change,
       momentum,
-      polyYes: odds.yes,
-      polyNo: odds.no,
-      yesTokenId: odds.yesTokenId,
-      noTokenId: odds.noTokenId,
-      marketId: odds.marketId,
-      question: odds.question,
+      polyYes: market.yesPrice,
+      polyNo: market.noPrice,
+      yesTokenId: market.yesTokenId,
+      noTokenId: market.noTokenId,
+      marketId: market.conditionId,
+      question: market.question,
       secondsRemaining,
       currentPrice: priceState.currentPrice,
     };

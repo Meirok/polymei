@@ -34,7 +34,6 @@ import {
   MIN_CONFIDENCE,
   SNIPE_WINDOW_START,
   SNIPE_WINDOW_END,
-  GAMMA_API,
 } from '../config.js';
 import type { ManagedPosition } from './risk/manager.js';
 import type { TradeSignal } from './strategies/sniper.js';
@@ -480,98 +479,58 @@ function setupConsoleCommands(): void {
 // ─── Startup Diagnostic ───────────────────────────────────────────────────────
 
 async function runStartupDiagnostic(): Promise<void> {
-  const lines: string[] = ['🔧 DIAGNÓSTICO DE INICIO'];
+  const lines: string[] = ['🔧 DIAGNÓSTICO'];
+  let allMarketsOk = true;
 
-  // ── Binance WS ─────────────────────────────────────────────────────────────
-  const btcState = binance.getState('BTC');
-  const ethState = binance.getState('ETH');
-  const solState = binance.getState('SOL');
-  const binanceOk = !!(btcState?.currentPrice || ethState?.currentPrice || solState?.currentPrice);
-
-  lines.push(`- Binance WS: ${binanceOk ? '✅' : '❌'} conectado`);
-
-  const fmtPrice = (sym: string, price: number): string => {
-    if (price <= 0) return `$N/A`;
-    if (sym === 'BTC') return `$${Math.round(price).toLocaleString('en-US')}`;
-    if (sym === 'ETH') return `$${Math.round(price).toLocaleString('en-US')}`;
-    return `$${price.toFixed(2)}`;
-  };
-
-  lines.push(`- BTC precio actual: ${fmtPrice('BTC', btcState?.currentPrice ?? 0)}`);
-  lines.push(`- ETH precio actual: ${fmtPrice('ETH', ethState?.currentPrice ?? 0)}`);
-  lines.push(`- SOL precio actual: ${fmtPrice('SOL', solState?.currentPrice ?? 0)}`);
-
-  // ── Polymarket API ─────────────────────────────────────────────────────────
-  let polyOk = false;
-  try {
-    const resp = await fetch(`${GAMMA_API}/markets?active=true&limit=1`);
-    polyOk = resp.ok;
-    lines.push(`- Polymarket API: ${polyOk ? '✅' : `❌ HTTP ${resp.status}`} conectado`);
-    if (!polyOk) {
-      lines.push(`  Detalle: ${resp.status} ${resp.statusText}`);
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    lines.push(`- Polymarket API: ❌ Error — ${msg}`);
-  }
-
-  // ── Wallet ─────────────────────────────────────────────────────────────────
-  const walletAddr = polymarket.getWalletAddress();
-  if (walletAddr) {
-    lines.push(`- Wallet address: ${walletAddr.slice(0, 6)}...${walletAddr.slice(-4)}`);
-  } else {
-    lines.push(`- Wallet address: N/A (sin clave privada)`);
-  }
-
-  // ── USDC balance ───────────────────────────────────────────────────────────
-  const balance = await polymarket.getUsdcBalance();
-  if (balance >= 0) {
-    lines.push(`- USDC balance: $${balance.toFixed(2)}`);
-  } else {
-    lines.push(`- USDC balance: ❌ Error al consultar`);
-  }
-
-  // ── Active markets per symbol ──────────────────────────────────────────────
-  let nextClose: Date | null = null;
-  const marketCounts: Record<string, number> = {};
-
+  // ── Markets per symbol (timestamp-based discovery) ─────────────────────────
   for (const sym of ['BTC', 'ETH', 'SOL']) {
     try {
       const markets = await polymarket.getActiveCryptoMarkets(sym);
-      marketCounts[sym] = markets.length;
-      lines.push(`- Mercados ${sym} activos encontrados: ${markets.length}`);
-
-      for (const m of markets) {
-        const expiry = new Date(m.endDateIso);
-        if (!nextClose || expiry < nextClose) nextClose = expiry;
+      const market = markets[0] ?? null;
+      if (market) {
+        const secs = polymarket.getSecondsUntilClose(market);
+        const mins = Math.floor(secs / 60);
+        const secPad = String(secs % 60).padStart(2, '0');
+        lines.push(`- ${sym} mercado actual: ✅ ${market.slug} | cierra en ${mins}m ${secPad}s`);
+      } else {
+        lines.push(`- ${sym} mercado actual: ❌ No se pudo obtener mercado`);
+        allMarketsOk = false;
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      marketCounts[sym] = 0;
-      lines.push(`- Mercados ${sym}: ❌ Error — ${msg}`);
+      lines.push(`- ${sym} mercado actual: ❌ ${msg}`);
+      allMarketsOk = false;
     }
   }
 
-  // ── Next market close ──────────────────────────────────────────────────────
-  if (nextClose) {
-    const hh = nextClose.getUTCHours().toString().padStart(2, '0');
-    const mm = nextClose.getUTCMinutes().toString().padStart(2, '0');
-    const ss = nextClose.getUTCSeconds().toString().padStart(2, '0');
-    lines.push(`- Próximo cierre de mercado: ${hh}:${mm}:${ss} UTC`);
-  } else {
-    lines.push(`- Próximo cierre de mercado: no encontrado`);
-  }
+  // ── Binance prices ─────────────────────────────────────────────────────────
+  const btcState = binance.getState('BTC');
+  const ethState = binance.getState('ETH');
+  const solState = binance.getState('SOL');
+
+  const fmtBinance = (sym: string, price: number): string => {
+    if (price <= 0) return '❌ N/A';
+    if (sym === 'BTC' || sym === 'ETH') return `$${Math.round(price).toLocaleString('en-US')} ✅`;
+    return `$${price.toFixed(2)} ✅`;
+  };
+
+  lines.push(`- Binance BTC: ${fmtBinance('BTC', btcState?.currentPrice ?? 0)}`);
+  lines.push(`- Binance ETH: ${fmtBinance('ETH', ethState?.currentPrice ?? 0)}`);
+  lines.push(`- Binance SOL: ${fmtBinance('SOL', solState?.currentPrice ?? 0)}`);
+
+  // ── Wallet & balance ───────────────────────────────────────────────────────
+  const walletAddr = polymarket.getWalletAddress();
+  const balance = await polymarket.getUsdcBalance();
+  const addrStr = walletAddr
+    ? `${walletAddr.slice(0, 6)}...${walletAddr.slice(-4)}`
+    : 'N/A';
+  const balStr = balance >= 0 ? `$${balance.toFixed(2)}` : '❌ Error';
+  lines.push(`- Wallet: ${addrStr} | USDC: ${balStr}`);
+
+  // ── Summary ────────────────────────────────────────────────────────────────
+  lines.push(allMarketsOk ? '- Listo para operar ✅' : '- ⚠️ Revisar errores antes de operar');
 
   telegram.sendLog(lines.join('\n'));
-
-  // Send per-symbol warning if 0 markets found
-  for (const sym of ['BTC', 'ETH', 'SOL']) {
-    if ((marketCounts[sym] ?? 0) === 0) {
-      telegram.sendLog(
-        `⚠️ Sin mercados activos para ${sym} — la estrategia no puede operar`
-      );
-    }
-  }
 }
 
 // ─── Startup ──────────────────────────────────────────────────────────────────
@@ -630,6 +589,9 @@ async function main(): Promise<void> {
   // Run startup diagnostic and send full status to Telegram
   logger.info('[Bot] Running startup diagnostic...');
   await runStartupDiagnostic();
+
+  // Start auto-refresh of markets every 30s (detects new 5-min windows)
+  polymarket.startAutoRefresh(SYMBOLS);
 
   // Start evaluation loop
   logger.info(`[Bot] Starting evaluation loop (every ${EVAL_INTERVAL_MS}ms)`);
