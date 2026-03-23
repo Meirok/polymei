@@ -218,6 +218,12 @@ export class Sniper {
       return null;
     }
 
+    // ── acceptingOrders check ─────────────────────────────────────────────────
+    if (!market.acceptingOrders) {
+      logger.debug(`[Sniper:${symbol}] SKIP — mercado no acepta órdenes`);
+      return null;
+    }
+
     // Update last known market for bot.ts market window tracking
     this.lastKnownMarket.set(symbol, market);
 

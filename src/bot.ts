@@ -482,7 +482,7 @@ async function runStartupDiagnostic(): Promise<void> {
   const lines: string[] = ['🔧 DIAGNÓSTICO'];
   let allMarketsOk = true;
 
-  // ── Markets per symbol (timestamp-based discovery) ─────────────────────────
+  // ── Markets per symbol (seriesSlug-based discovery) ───────────────────────
   for (const sym of ['BTC', 'ETH', 'SOL']) {
     try {
       const markets = await polymarket.getActiveCryptoMarkets(sym);
@@ -491,14 +491,18 @@ async function runStartupDiagnostic(): Promise<void> {
         const secs = polymarket.getSecondsUntilClose(market);
         const mins = Math.floor(secs / 60);
         const secPad = String(secs % 60).padStart(2, '0');
-        lines.push(`- ${sym} mercado actual: ✅ ${market.slug} | cierra en ${mins}m ${secPad}s`);
+        lines.push(
+          `- ${sym}: ✅ ${market.slug}\n` +
+          `  - Cierra en: ${mins}min ${secPad}s | UP: ${market.yesPrice.toFixed(2)} | DOWN: ${market.noPrice.toFixed(2)}\n` +
+          `  - Acepta órdenes: ${market.acceptingOrders ? '✅' : '❌'}`
+        );
       } else {
-        lines.push(`- ${sym} mercado actual: ❌ No se pudo obtener mercado`);
+        lines.push(`- ${sym}: ❌ No se pudo obtener mercado`);
         allMarketsOk = false;
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      lines.push(`- ${sym} mercado actual: ❌ ${msg}`);
+      lines.push(`- ${sym}: ❌ ${msg}`);
       allMarketsOk = false;
     }
   }
@@ -521,12 +525,12 @@ async function runStartupDiagnostic(): Promise<void> {
   // ── Wallet ─────────────────────────────────────────────────────────────────
   const walletAddr = polymarket.getWalletAddress();
   const addrStr = walletAddr
-    ? `${walletAddr.slice(0, 6)}...${walletAddr.slice(-4)}`
+    ? `0x${walletAddr.slice(2, 6)}...${walletAddr.slice(-4)}`
     : 'N/A';
-  lines.push(`💰 Wallet conectada: ${addrStr} ✅`);
+  lines.push(`- Wallet: ${addrStr} ${walletAddr ? '✅' : '❌'}`);
 
   // ── Summary ────────────────────────────────────────────────────────────────
-  lines.push(allMarketsOk ? '- Listo para operar ✅' : '- ⚠️ Revisar errores antes de operar');
+  lines.push(allMarketsOk ? '- ✅ Listo para operar' : '- ⚠️ Revisar errores antes de operar');
 
   telegram.sendLog(lines.join('\n'));
 }
