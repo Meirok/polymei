@@ -14,7 +14,7 @@
 import 'dotenv/config';
 import readline from 'readline';
 import { BinanceFeed } from './feeds/binance.js';
-import { PolymarketClient } from './polymarket/client.js';
+import { PolymarketClient, logTimestampVerification } from './polymarket/client.js';
 import { Sniper, secondsUntilNext5MinBoundary } from './strategies/sniper.js';
 import { RiskManager } from './risk/manager.js';
 import { TelegramNotifier } from './notifications/telegram.js';
@@ -482,7 +482,7 @@ async function runStartupDiagnostic(): Promise<void> {
   const lines: string[] = ['🔧 DIAGNÓSTICO'];
   let allMarketsOk = true;
 
-  // ── Markets per symbol (seriesSlug-based discovery) ───────────────────────
+  // ── Markets per symbol (timestamp-based slug discovery) ───────────────────
   for (const sym of ['BTC', 'ETH', 'SOL']) {
     try {
       const markets = await polymarket.getActiveCryptoMarkets(sym);
@@ -492,12 +492,13 @@ async function runStartupDiagnostic(): Promise<void> {
         const mins = Math.floor(secs / 60);
         const secPad = String(secs % 60).padStart(2, '0');
         lines.push(
-          `- ${sym}: ✅ ${market.slug}\n` +
-          `  - Cierra en: ${mins}min ${secPad}s | UP: ${market.yesPrice.toFixed(2)} | DOWN: ${market.noPrice.toFixed(2)}\n` +
-          `  - Acepta órdenes: ${market.acceptingOrders ? '✅' : '❌'}`
+          `- ${sym}: ✅ ${market.slug} | UP: ${market.yesPrice.toFixed(2)} | DOWN: ${market.noPrice.toFixed(2)} | ` +
+          `cierra en ${mins}min ${secPad}s | acepta órdenes: ${market.acceptingOrders ? '✅' : '❌'}`
         );
       } else {
-        lines.push(`- ${sym}: ❌ No se pudo obtener mercado`);
+        const candidates = polymarket.getCandidateTimestamps();
+        const tsStr = candidates.join(', ');
+        lines.push(`- ${sym}: ❌ No encontrado — timestamps probados: ${tsStr}`);
         allMarketsOk = false;
       }
     } catch (err) {
@@ -614,6 +615,9 @@ async function main(): Promise<void> {
   // Wait briefly for initial price data
   logger.info('[Bot] Waiting 3s for initial price data...');
   await sleep(3000);
+
+  // Log timestamp math so we can verify ET-alignment before trusting slugs
+  logTimestampVerification();
 
   // Debug Gamma API — log raw responses to console before regular fetch
   logger.info('[Bot] Debugging Gamma API...');
