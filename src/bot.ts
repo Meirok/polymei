@@ -253,6 +253,7 @@ async function evaluationTick(): Promise<void> {
       const existing = marketWindows.get(sym);
       // Register new window or update if market changed
       if (!existing || existing.expiryMs !== known.expiryMs) {
+        sniper.resetWindow(sym);
         marketWindows.set(sym, {
           symbol: sym,
           question: known.question,
@@ -296,9 +297,9 @@ async function evaluationTick(): Promise<void> {
       `${expiryDate.getUTCHours().toString().padStart(2, '0')}:` +
       `${expiryDate.getUTCMinutes().toString().padStart(2, '0')} UTC`;
 
-    const noTradeReason = win.noTradeReasons.length > 0
-      ? win.noTradeReasons[win.noTradeReasons.length - 1] // most recent reason
-      : undefined;
+    const noTradeReason = win.betPlaced
+      ? undefined
+      : sniper.getSkipReason(sym);
 
     telegram.notifyMarketClose({
       symbol: sym,

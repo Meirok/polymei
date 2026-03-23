@@ -141,6 +141,11 @@ export class Sniper {
   // Cache the last known market found per symbol (for debug logging + bot.ts tracking)
   private lastKnownMarket: Map<string, Market | null> = new Map();
 
+  // Skip reason tracking per symbol per window
+  private skipReason: Map<string, string> = new Map();
+  private maxChange: Map<string, number> = new Map();
+  private maxSecondsReached: Map<string, number> = new Map();
+
   // Optional callback for sending log messages to Telegram
   private logFn?: (msg: string) => void;
 
@@ -215,12 +220,14 @@ export class Sniper {
     // ── Market check ─────────────────────────────────────────────────────────
     if (!market) {
       logger.debug(`[Sniper:${symbol}] SKIP — sin mercado en caché (esperando auto-refresh)`);
+      this.skipReason.set(symbol, 'mercado no encontrado en Polymarket');
       return null;
     }
 
     // ── acceptingOrders check ─────────────────────────────────────────────────
     if (!market.acceptingOrders) {
       logger.debug(`[Sniper:${symbol}] SKIP — mercado no acepta órdenes`);
+      this.skipReason.set(symbol, 'mercado no aceptaba órdenes');
       return null;
     }
 
@@ -228,10 +235,20 @@ export class Sniper {
     this.lastKnownMarket.set(symbol, market);
 
     // ── 2. Time window check ─────────────────────────────────────────────────
+    const prevMaxSecs = this.maxSecondsReached.get(symbol) ?? 999;
+    if (secondsRemaining < prevMaxSecs) {
+      this.maxSecondsReached.set(symbol, secondsRemaining);
+    }
+
     if (secondsRemaining > SNIPE_WINDOW_START || secondsRemaining < SNIPE_WINDOW_END) {
       logger.debug(
         `[Sniper:${symbol}] SKIP — fuera de ventana ` +
         `(${secondsRemaining.toFixed(1)}s, ventana: ${SNIPE_WINDOW_END}s–${SNIPE_WINDOW_START}s)`
+      );
+      const maxChange = this.maxChange.get(symbol) ?? 0;
+      this.skipReason.set(
+        symbol,
+        `movimiento insuficiente (max: +${maxChange.toFixed(2)}%, necesita >${MIN_PRICE_CHANGE_PCT}%)`
       );
       return null;
     }
@@ -257,15 +274,26 @@ export class Sniper {
     const change = priceState.changePercent;
     const momentum = priceState.momentum;
 
+    // Track max absolute change seen
+    const prevMaxChange = this.maxChange.get(symbol) ?? 0;
+    if (Math.abs(change) > prevMaxChange) {
+      this.maxChange.set(symbol, Math.abs(change));
+    }
+
     // ── 5. Direction check ───────────────────────────────────────────────────
-    const isLong  = change > MIN_PRICE_CHANGE_PCT && momentum >= 0;
-    const isShort = change < -MIN_PRICE_CHANGE_PCT && momentum <= 0;
+    const isLong  = change > MIN_PRICE_CHANGE_PCT;
+    const isShort = change < -MIN_PRICE_CHANGE_PCT;
 
     if (!isLong && !isShort) {
       logger.debug(
         `[Sniper:${symbol}] SKIP — sin dirección clara ` +
         `(cambio=${change >= 0 ? '+' : ''}${change.toFixed(3)}% vs umbral ±${MIN_PRICE_CHANGE_PCT}%, ` +
         `momentum=${momentum >= 0 ? '+' : ''}${momentum.toFixed(4)})`
+      );
+      const maxChange = this.maxChange.get(symbol) ?? 0;
+      this.skipReason.set(
+        symbol,
+        `movimiento insuficiente (max: ${maxChange >= 0 ? '+' : ''}${maxChange.toFixed(2)}%, necesita >${MIN_PRICE_CHANGE_PCT}%)`
       );
       return null;
     }
@@ -299,6 +327,7 @@ export class Sniper {
           `- Odds UP: ${market.upPrice.toFixed(3)}\n` +
           `- Resultado: ❌ Rechazada (UP ya priceado ≥ ${MAX_ENTRY_PRICE})`
         );
+        this.skipReason.set(symbol, `mercado ya priceado correctamente (odds ≥ ${MAX_ENTRY_PRICE})`);
         return null;
       }
       action = 'BUY_YES';
@@ -315,6 +344,7 @@ export class Sniper {
           `- Odds DOWN: ${market.downPrice.toFixed(3)}\n` +
           `- Resultado: ❌ Rechazada (DOWN ya priceado ≥ ${MAX_ENTRY_PRICE})`
         );
+        this.skipReason.set(symbol, `mercado ya priceado correctamente (odds ≥ ${MAX_ENTRY_PRICE})`);
         return null;
       }
       action = 'BUY_NO';
@@ -345,6 +375,7 @@ export class Sniper {
         `- Confianza: ${confidence}/100\n` +
         `- Resultado: ❌ Rechazada (confianza < mínimo ${MIN_CONFIDENCE})`
       );
+      this.skipReason.set(symbol, `confianza baja (max: ${confidence}/100, necesita >${MIN_CONFIDENCE})`);
       return null;
     }
 
@@ -396,5 +427,17 @@ export class Sniper {
   /** Reset cooldown for a symbol (e.g. after position closes) */
   resetCooldown(symbol: string): void {
     this.lastSignalTime.delete(symbol);
+  }
+
+  /** Get the skip reason for a symbol from the current window */
+  getSkipReason(symbol: string): string {
+    return this.skipReason.get(symbol) ?? 'sin señal en toda la ventana';
+  }
+
+  /** Reset per-window tracking for a symbol when a new market window opens */
+  resetWindow(symbol: string): void {
+    this.skipReason.delete(symbol);
+    this.maxChange.delete(symbol);
+    this.maxSecondsReached.delete(symbol);
   }
 }
