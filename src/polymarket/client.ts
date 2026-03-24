@@ -139,7 +139,21 @@ export function logTimestampVerification(): void {
 // ─── RPC Fallback ─────────────────────────────────────────────────────────────
 
 async function getProvider(): Promise<ethers.providers.JsonRpcProvider> {
-  return new ethers.providers.JsonRpcProvider('https://polygon.llamarpc.com');
+  const provider = new ethers.providers.JsonRpcProvider('https://polygon.llamarpc.com');
+
+  // Wait up to 10 s for the RPC to respond before handing the provider to callers.
+  // If all retries fail we still return the provider — CLOB API calls don't need RPC
+  // and on-chain checks have their own try/catch guards.
+  for (let i = 0; i < 5; i++) {
+    try {
+      await provider.getNetwork();
+      return provider;
+    } catch {
+      if (i < 4) await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+  }
+  logger.warn('[PolymarketClient] Could not detect Polygon network after 5 attempts — continuing without RPC confirmation');
+  return provider;
 }
 
 // ─── On-chain Contract Constants ─────────────────────────────────────────────
@@ -260,9 +274,10 @@ export class PolymarketClient {
       `[PolymarketClient] Initialized — funder: ${funder} | signer: ${wallet.address} | signatureType: ${sigType}`
     );
 
-    // Startup on-chain checks (non-blocking — log errors but don't abort)
-    await this.logUsdcBalance(wallet);
-    await this.ensureNegRiskAllowance(wallet);
+    // Startup on-chain checks — fire-and-forget so a slow/unavailable RPC never
+    // blocks the bot from starting. Failures are logged as warnings, not errors.
+    this.logUsdcBalance(wallet).catch(() => {/* already logged inside */});
+    this.ensureNegRiskAllowance(wallet).catch(() => {/* already logged inside */});
   }
 
   /**
@@ -374,10 +389,11 @@ export class PolymarketClient {
         `- Tx: ${tx.hash}`
       );
     } catch (err) {
-      logger.error(`[PolymarketClient] Failed to check/approve NegRisk allowance: ${err}`);
+      logger.warn(`[PolymarketClient] Could not verify/approve NegRisk allowance (network issue — allowance may already be set): ${err}`);
       this.logFn?.(
-        `⚠️ ERROR al aprobar NegRisk Exchange\n` +
+        `⚠️ Warning: no se pudo verificar allowance NegRisk Exchange (error de red)\n` +
         `- Contrato: ${NEGRISK_EXCHANGE_ADDRESS}\n` +
+        `- El bot continúa operando normalmente\n` +
         `- Detalle: ${err}`
       );
     }
