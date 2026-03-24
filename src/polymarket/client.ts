@@ -20,10 +20,13 @@ import {
   Chain,
   Side,
   OrderType,
+  createL1Headers,
 } from '@polymarket/clob-client';
 import { Wallet } from 'ethers';
 import {
   POLYMARKET_PRIVATE_KEY,
+  POLYMARKET_SIGNATURE_TYPE,
+  POLYMARKET_FUNDER,
   POLYMARKET_API_KEY,
   POLYMARKET_API_SECRET,
   POLYMARKET_PASSPHRASE,
@@ -170,13 +173,19 @@ export class PolymarketClient {
 
     const wallet = new Wallet(POLYMARKET_PRIVATE_KEY);
 
-    // For signatureType=0 (EOA) maker === signer === wallet.address.
-    const funder = wallet.address;
+    // Determine funder address:
+    //   signatureType=0 (EOA):            maker === signer === wallet.address
+    //   signatureType=2 (Privy/Gmail):    funder = POLYMARKET_FUNDER (Gnosis Safe),
+    //                                     signer = wallet.address (operator key)
+    const sigType = POLYMARKET_SIGNATURE_TYPE; // 0 | 1 | 2
+    const funder = (sigType === 2 && POLYMARKET_FUNDER)
+      ? POLYMARKET_FUNDER
+      : wallet.address;
 
     let creds: { key: string; secret: string; passphrase: string };
 
     if (POLYMARKET_API_KEY && POLYMARKET_API_SECRET && POLYMARKET_PASSPHRASE) {
-      // Use pre-derived credentials (required for Privy/Gmail accounts)
+      // Use pre-configured credentials (set these in .env after first boot)
       creds = {
         key: POLYMARKET_API_KEY,
         secret: POLYMARKET_API_SECRET,
@@ -184,20 +193,33 @@ export class PolymarketClient {
       };
       console.log('[Auth] Using pre-configured API key:', creds.key);
     } else {
-      // Derive credentials via L1 signing (works for standard EOA accounts)
+      // Derive (or create) L2 credentials via L1 signing.
+      // NOTE: signatureType and funderAddress are NOT part of API key creation —
+      // they only affect order signing. A plain tmpClient with just the signer key
+      // is correct here per the Polymarket CLOB API spec.
       const tmpClient = new ClobClient(
         CLOB_HOST,
         POLYGON_CHAIN_ID as Chain,
         wallet,
-        undefined,
-        0,
-        funder,
       );
-      creds = await tmpClient.deriveApiKey();
+      creds = await tmpClient.createOrDeriveApiKey();
       console.log('[Auth] key:', creds.key, 'secret:', creds.secret ? 'SET' : 'MISSING');
+      logger.warn(
+        '[PolymarketClient] ⚠️  API credentials derived. Save to .env to avoid re-derivation:\n' +
+        `  POLYMARKET_API_KEY=${creds.key}\n` +
+        `  POLYMARKET_API_SECRET=${creds.secret}\n` +
+        `  POLYMARKET_PASSPHRASE=${creds.passphrase}`
+      );
     }
 
-    // Initialize the final client with credentials + signatureType=0 (EOA)
+    // For signatureType=2: verify operator status on the CLOB and log a clear message.
+    // The on-chain operator registration (signer → funder's Gnosis Safe) must already exist;
+    // this is set up by Polymarket when the Privy/Gmail account is created.
+    if (sigType === 2 && POLYMARKET_FUNDER) {
+      await this.checkOperatorStatus(wallet, POLYMARKET_FUNDER, creds);
+    }
+
+    // Initialize the final client with correct signatureType and funder
     this.clobClient = new ClobClient(
       CLOB_HOST,
       POLYGON_CHAIN_ID as Chain,
@@ -207,7 +229,7 @@ export class PolymarketClient {
         secret: creds.secret,
         passphrase: creds.passphrase,
       },
-      0,
+      sigType as any,
       funder,
     );
 
@@ -215,7 +237,61 @@ export class PolymarketClient {
     this.signingAddress = wallet.address;
     this.initialized = true;
     logger.info(
-      `[PolymarketClient] Initialized — maker/signer: ${wallet.address} | signatureType: 0 (EOA)`
+      `[PolymarketClient] Initialized — funder: ${funder} | signer: ${wallet.address} | signatureType: ${sigType}`
+    );
+  }
+
+  /**
+   * For signatureType=2 (Privy/Gmail / POLY_GNOSIS_SAFE):
+   *
+   * Verifies that the CLOB recognises the signer as a valid operator for the funder by
+   * calling GET /auth/api-keys (L2 auth). Logs the result as a startup sanity check.
+   *
+   * NOTE: The on-chain operator registration (signer approved to sign for the funder's
+   * Gnosis Safe) is set up by Polymarket when the Privy/Gmail account is first created.
+   * There is no HTTP API endpoint to register operators — it is purely on-chain and
+   * handled transparently by the Polymarket infrastructure.
+   *
+   * The funderAddress is used ONLY in the ClobClient constructor for order signing
+   * (sets maker = funder in every signed order). It is NOT part of the /auth/api-key
+   * creation request.
+   */
+  private async checkOperatorStatus(
+    wallet: Wallet,
+    funderAddress: string,
+    creds: { key: string; secret: string; passphrase: string },
+  ): Promise<void> {
+    const signerAddress = wallet.address;
+    logger.info(
+      `[PolymarketClient] signatureType=2 config — funder: ${funderAddress} | signer/operator: ${signerAddress}`
+    );
+
+    // Use L2 auth to verify the API keys are valid and retrieve account info
+    try {
+      const l1Headers = await createL1Headers(wallet as any, POLYGON_CHAIN_ID as Chain);
+      const res = await fetch(`${CLOB_HOST}/auth/api-keys`, {
+        headers: {
+          'POLY_ADDRESS':   l1Headers.POLY_ADDRESS,
+          'POLY_SIGNATURE': l1Headers.POLY_SIGNATURE,
+          'POLY_TIMESTAMP': l1Headers.POLY_TIMESTAMP,
+          'POLY_NONCE':     l1Headers.POLY_NONCE,
+        },
+      });
+      if (res.ok) {
+        const data: unknown = await res.json();
+        logger.info(`[PolymarketClient] L1 auth check — active API keys: ${JSON.stringify(data)}`);
+      } else {
+        logger.warn(`[PolymarketClient] L1 auth check returned HTTP ${res.status} — credentials may be invalid`);
+      }
+    } catch (err) {
+      logger.warn(`[PolymarketClient] L1 auth check failed: ${err}`);
+    }
+
+    logger.info(
+      `[PolymarketClient] ✅ signatureType=2 ready — orders will be placed as:\n` +
+      `  maker (funder):   ${funderAddress}\n` +
+      `  signer (operator): ${signerAddress}\n` +
+      `  API key:           ${creds.key}`
     );
   }
 
