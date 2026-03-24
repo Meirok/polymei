@@ -19,7 +19,7 @@ import {
   SCALPER_PROFIT_TARGET,
   SCALPER_MAX_ENTRY_PRICE,
   SCALPER_FORCE_SELL_SECONDS,
-  SCALPER_POSITION_SIZE_USD,
+  MAX_POSITION_USD,
 } from '../../config.js';
 import { logger } from '../utils/logger.js';
 
@@ -98,7 +98,7 @@ export class Scalper {
         tokenId,
         side: 'BUY',
         price: entryPrice + 0.01,
-        sizeUsd: SCALPER_POSITION_SIZE_USD,
+        sizeUsd: MAX_POSITION_USD,
         marketId: market.conditionId,
         symbol,
       });
@@ -119,15 +119,16 @@ export class Scalper {
         marketId: market.conditionId,
         question: market.slug,
       };
+      const actualEntry = result.price;
+      const actualCostUsd = result.sizeShares * result.price;
       const managedPos = this.risk.openPosition(
         posParams,
         result.orderId!,
-        result.price,
+        actualEntry,
         result.sizeShares,
-        SCALPER_POSITION_SIZE_USD
+        actualCostUsd
       );
 
-      const actualEntry = result.price;
       const targetPrice = actualEntry + SCALPER_PROFIT_TARGET;
 
       this.openPositions.set(symbol, {
@@ -135,7 +136,7 @@ export class Scalper {
         tokenId,
         entryPrice: actualEntry,
         sharesAmount: result.sizeShares,
-        usdInvested: SCALPER_POSITION_SIZE_USD,
+        usdInvested: actualCostUsd,
         side,
         marketSlug: market.slug,
         marketId: market.conditionId,
@@ -149,7 +150,7 @@ export class Scalper {
         `• Dirección: ${side}\n` +
         `• Entrada: ${actualEntry.toFixed(3)}\n` +
         `• Target venta: ${targetPrice.toFixed(3)}\n` +
-        `• Invertido: $${SCALPER_POSITION_SIZE_USD}\n` +
+        `• Invertido: $${actualCostUsd.toFixed(3)}\n` +
         `• Shares: ${result.sizeShares}\n` +
         `• Mercado: ${market.slug}`
       );

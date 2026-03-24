@@ -465,7 +465,7 @@ export class PolymarketClient {
       const result = await this.clobClient!.postOrder(signedOrder, OrderType.GTC);
       console.log('[placeOrder] post result:', JSON.stringify(result));
 
-      if (!result || result.errorCode) {
+      if (!result || result.errorCode || result.error) {
         const errMsg = result?.error || result?.errorCode || JSON.stringify(result);
         this.logFn?.(
           `⚠️ ERROR: polymarket\n` +
