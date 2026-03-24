@@ -28,6 +28,7 @@ import {
   POLYGON_CHAIN_ID,
   DRY_RUN,
   SLIPPAGE_BUFFER,
+  MAX_POSITION_USD,
 } from '../../config.js';
 import { logger } from '../utils/logger.js';
 
@@ -430,9 +431,13 @@ export class PolymarketClient {
 
     const { tokenId, side, price, sizeUsd, marketId } = params;
 
-    // Convert dollar amount to shares; enforce minimum 5 shares
-    const sizeShares = Math.floor(sizeUsd / price);
-    const amount = Math.max(sizeShares, 5);
+    // Convert dollar amount to shares.
+    // BUY: size is capped by MAX_POSITION_USD to enforce the risk limit.
+    // SELL: use the passed sizeUsd (= sharesHeld * price) to sell the exact position.
+    const rawShares = side === 'BUY'
+      ? Math.floor(MAX_POSITION_USD / price)
+      : Math.floor(sizeUsd / price);
+    const amount = Math.max(1, rawShares);
     const effectivePrice = Math.min(Math.max(price + SLIPPAGE_BUFFER, 0.01), 0.99);
 
     console.log('[placeOrder] params:', { tokenId, side, amount, price: effectivePrice });
