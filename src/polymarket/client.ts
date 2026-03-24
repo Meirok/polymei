@@ -138,25 +138,8 @@ export function logTimestampVerification(): void {
 
 // ─── RPC Fallback ─────────────────────────────────────────────────────────────
 
-const RPC_URLS = [
-  'https://rpc-mainnet.matic.quiknode.pro',
-  'https://polygon-rpc.com',
-  'https://rpc.ankr.com/polygon',
-  'https://polygon.llamarpc.com',
-  'https://1rpc.io/matic',
-];
-
 async function getProvider(): Promise<ethers.providers.JsonRpcProvider> {
-  for (const url of RPC_URLS) {
-    try {
-      const provider = new ethers.providers.JsonRpcProvider(url);
-      await provider.getNetwork();
-      return provider;
-    } catch {
-      continue;
-    }
-  }
-  throw new Error('No se pudo conectar a ningún RPC de Polygon');
+  return new ethers.providers.JsonRpcProvider('https://polygon.llamarpc.com');
 }
 
 // ─── On-chain Contract Constants ─────────────────────────────────────────────
