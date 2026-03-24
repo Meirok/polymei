@@ -27,7 +27,6 @@ import {
   DRY_RUN,
   DAILY_LOSS_LIMIT_USD,
   MAX_CONCURRENT_POSITIONS,
-  MAX_POSITION_USD,
   SCALPER_PROFIT_TARGET,
   SCALPER_MAX_ENTRY_PRICE,
   SCALPER_FORCE_SELL_SECONDS,
@@ -183,7 +182,7 @@ export class TelegramNotifier {
     this.send(
       `🟢 Bot iniciado en modo ${DRY_RUN ? 'DRY RUN' : 'LIVE'}\n` +
       `- Símbolos: ${SYMBOLS.join(', ')}\n` +
-      `- Tamaño posición: $${MAX_POSITION_USD}\n` +
+      `- Tamaño posición: $${SCALPER_POSITION_SIZE_USD}\n` +
       `- Límite diario: $${DAILY_LOSS_LIMIT_USD}\n` +
       `- Target de ganancia: +${SCALPER_PROFIT_TARGET}\n` +
       `- Precio máx entrada: ${SCALPER_MAX_ENTRY_PRICE}\n` +
