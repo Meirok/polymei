@@ -69,6 +69,10 @@ export const MAX_CONCURRENT_POSITIONS = parseInt(
   10
 );
 export const DAILY_LOSS_LIMIT_USD = parseFloat(optionalEnv('DAILY_LOSS_LIMIT_USD', '25'));
+/** Maximum total USDC committed across all open positions at once */
+export const WALLET_BUDGET_USD = parseFloat(
+  optionalEnv('WALLET_BUDGET_USD', String(MAX_CONCURRENT_POSITIONS * SCALPER_POSITION_SIZE_USD))
+);
 
 // ─── Execution ───────────────────────────────────────────────────────────────
 /** Paper trading mode — no real orders */

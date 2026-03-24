@@ -13,6 +13,7 @@
 import {
   MAX_CONCURRENT_POSITIONS,
   DAILY_LOSS_LIMIT_USD,
+  WALLET_BUDGET_USD,
 } from '../../config.js';
 import { logger } from '../utils/logger.js';
 
@@ -82,14 +83,16 @@ export class RiskManager {
   private dailyResetDate = this.todayKey();
   private halted = false;
   private positionCounter = 0;
+  private committedUsd = 0;
 
   // ─── Gate Checks ──────────────────────────────────────────────────────────
 
   /**
    * Returns whether we're allowed to open a new position.
-   * Checks: halt flag, daily loss limit, concurrent position cap.
+   * Checks: halt flag, daily loss limit, concurrent position cap, wallet budget.
+   * @param sizeUsd - USD amount of the position about to be opened
    */
-  canOpenPosition(): { allowed: boolean; reason?: string } {
+  canOpenPosition(sizeUsd = 0): { allowed: boolean; reason?: string } {
     this.checkDailyReset();
 
     if (this.halted) {
@@ -108,6 +111,13 @@ export class RiskManager {
       return {
         allowed: false,
         reason: `Max concurrent positions (${MAX_CONCURRENT_POSITIONS}) reached`,
+      };
+    }
+
+    if (sizeUsd > 0 && this.committedUsd + sizeUsd > WALLET_BUDGET_USD) {
+      return {
+        allowed: false,
+        reason: `Wallet budget exceeded: committed $${this.committedUsd.toFixed(2)} + $${sizeUsd.toFixed(2)} > budget $${WALLET_BUDGET_USD.toFixed(2)}`,
       };
     }
 
@@ -141,7 +151,8 @@ export class RiskManager {
     };
 
     this.openPositions.set(id, position);
-    logger.info(`[RiskManager] Position opened: ${id} — ${params.symbol} ${params.side} $${costUsd.toFixed(2)}`);
+    this.committedUsd += costUsd;
+    logger.info(`[RiskManager] Position opened: ${id} — ${params.symbol} ${params.side} $${costUsd.toFixed(2)} (committed: $${this.committedUsd.toFixed(2)})`);
     return position;
   }
 
@@ -166,6 +177,7 @@ export class RiskManager {
     pos.closedAt = Date.now();
 
     this.openPositions.delete(positionId);
+    this.committedUsd = Math.max(0, this.committedUsd - pos.costUsd);
 
     // Update P&L
     this.dailyPnl += pnlUsd;
@@ -202,6 +214,7 @@ export class RiskManager {
     if (pos) {
       pos.status = 'CANCELLED';
       this.openPositions.delete(positionId);
+      this.committedUsd = Math.max(0, this.committedUsd - pos.costUsd);
     }
   }
 

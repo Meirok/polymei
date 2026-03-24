@@ -19,7 +19,7 @@ import {
   SCALPER_PROFIT_TARGET,
   SCALPER_MAX_ENTRY_PRICE,
   SCALPER_FORCE_SELL_SECONDS,
-  MAX_POSITION_USD,
+  SCALPER_POSITION_SIZE_USD,
 } from '../../config.js';
 import { logger } from '../utils/logger.js';
 
@@ -60,7 +60,7 @@ export class Scalper {
     if (this.openPositions.has(symbol)) return;
 
     // Check risk gate (halt + daily loss limit)
-    const { allowed, reason } = this.risk.canOpenPosition();
+    const { allowed, reason } = this.risk.canOpenPosition(SCALPER_POSITION_SIZE_USD);
     if (!allowed) {
       const msg = `riesgo bloqueado: ${reason}`;
       this.skipReasons.set(symbol, msg);
@@ -98,7 +98,7 @@ export class Scalper {
         tokenId,
         side: 'BUY',
         price: entryPrice + 0.01,
-        sizeUsd: MAX_POSITION_USD,
+        sizeUsd: SCALPER_POSITION_SIZE_USD,
         marketId: market.conditionId,
         symbol,
       });
