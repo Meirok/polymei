@@ -24,8 +24,6 @@ import {
 import { Wallet } from 'ethers';
 import {
   POLYMARKET_PRIVATE_KEY,
-  POLYMARKET_SIGNATURE_TYPE,
-  POLYMARKET_FUNDER,
   POLYMARKET_API_KEY,
   POLYMARKET_API_SECRET,
   POLYMARKET_PASSPHRASE,
@@ -173,10 +171,8 @@ export class PolymarketClient {
 
     const wallet = new Wallet(POLYMARKET_PRIVATE_KEY);
 
-    // Funder address: use env var if set, otherwise fall back to wallet address.
-    // For signatureType=2 (Privy/Gnosis Safe) the funder is the account address
-    // that holds the internal Polymarket balance.
-    const funder = POLYMARKET_FUNDER || wallet.address;
+    // For signatureType=0 (EOA) maker === signer === wallet.address.
+    const funder = wallet.address;
 
     let creds: { key: string; secret: string; passphrase: string };
 
@@ -195,14 +191,14 @@ export class PolymarketClient {
         POLYGON_CHAIN_ID as Chain,
         wallet,
         undefined,
-        POLYMARKET_SIGNATURE_TYPE,
+        0,
         funder,
       );
       creds = await tmpClient.deriveApiKey();
       console.log('[Auth] key:', creds.key, 'secret:', creds.secret ? 'SET' : 'MISSING');
     }
 
-    // Initialize the final client with credentials + correct signature type
+    // Initialize the final client with credentials + signatureType=0 (EOA)
     this.clobClient = new ClobClient(
       CLOB_HOST,
       POLYGON_CHAIN_ID as Chain,
@@ -212,15 +208,15 @@ export class PolymarketClient {
         secret: creds.secret,
         passphrase: creds.passphrase,
       },
-      POLYMARKET_SIGNATURE_TYPE,
+      0,
       funder,
     );
 
     this.wallet = wallet;
-    this.signingAddress = funder;
+    this.signingAddress = wallet.address;
     this.initialized = true;
     logger.info(
-      `[PolymarketClient] Initialized — signer: ${wallet.address} | funder: ${funder} | signatureType: ${POLYMARKET_SIGNATURE_TYPE}`
+      `[PolymarketClient] Initialized — maker/signer: ${wallet.address} | signatureType: 0 (EOA)`
     );
   }
 
