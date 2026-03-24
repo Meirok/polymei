@@ -32,7 +32,6 @@ import {
   POLYMARKET_PASSPHRASE,
   CLOB_HOST,
   POLYGON_CHAIN_ID,
-  POLYGON_RPC_URL,
   DRY_RUN,
   SLIPPAGE_BUFFER,
 } from '../../config.js';
@@ -137,6 +136,29 @@ export function logTimestampVerification(): void {
   console.log(`[TimestampCheck] Slugs to try: btc-updown-5m-${ts}, btc-updown-5m-${ts + 300}`);
 }
 
+// ─── RPC Fallback ─────────────────────────────────────────────────────────────
+
+const RPC_URLS = [
+  'https://rpc-mainnet.matic.quiknode.pro',
+  'https://polygon-rpc.com',
+  'https://rpc.ankr.com/polygon',
+  'https://polygon.llamarpc.com',
+  'https://1rpc.io/matic',
+];
+
+async function getProvider(): Promise<ethers.providers.JsonRpcProvider> {
+  for (const url of RPC_URLS) {
+    try {
+      const provider = new ethers.providers.JsonRpcProvider(url);
+      await provider.getNetwork();
+      return provider;
+    } catch {
+      continue;
+    }
+  }
+  throw new Error('No se pudo conectar a ningún RPC de Polygon');
+}
+
 // ─── On-chain Contract Constants ─────────────────────────────────────────────
 
 /** USDC (PoS) on Polygon */
@@ -185,7 +207,7 @@ export class PolymarketClient {
       throw new Error('POLYMARKET_PRIVATE_KEY is required for live trading');
     }
 
-    const provider = new ethers.providers.JsonRpcProvider(POLYGON_RPC_URL);
+    const provider = await getProvider();
     const wallet = new Wallet(POLYMARKET_PRIVATE_KEY, provider);
 
     // Determine funder address:
