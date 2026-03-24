@@ -20,6 +20,7 @@ export const POLYMARKET_PRIVATE_KEY = optionalEnv('POLYMARKET_PRIVATE_KEY', '');
 export const CLOB_HOST = 'https://clob.polymarket.com';
 export const GAMMA_API = 'https://gamma-api.polymarket.com';
 export const POLYGON_CHAIN_ID = 137;
+export const POLYGON_RPC_URL = optionalEnv('POLYGON_RPC_URL', 'https://polygon-rpc.com');
 
 /**
  * Signature type for order signing:

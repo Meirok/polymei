@@ -22,7 +22,7 @@ import {
   OrderType,
   createL1Headers,
 } from '@polymarket/clob-client';
-import { Wallet } from 'ethers';
+import { ethers, Wallet } from 'ethers';
 import {
   POLYMARKET_PRIVATE_KEY,
   POLYMARKET_SIGNATURE_TYPE,
@@ -32,6 +32,7 @@ import {
   POLYMARKET_PASSPHRASE,
   CLOB_HOST,
   POLYGON_CHAIN_ID,
+  POLYGON_RPC_URL,
   DRY_RUN,
   SLIPPAGE_BUFFER,
 } from '../../config.js';
@@ -136,6 +137,19 @@ export function logTimestampVerification(): void {
   console.log(`[TimestampCheck] Slugs to try: btc-updown-5m-${ts}, btc-updown-5m-${ts + 300}`);
 }
 
+// ─── On-chain Contract Constants ─────────────────────────────────────────────
+
+/** USDC (PoS) on Polygon */
+const USDC_CONTRACT_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+/** NegRisk CTF Exchange — used by all 5-minute crypto up/down markets */
+const NEGRISK_EXCHANGE_ADDRESS = '0xC5d563A36AE78145C45a50134d48A1215220f80a';
+
+const ERC20_ABI = [
+  'function allowance(address owner, address spender) view returns (uint256)',
+  'function approve(address spender, uint256 amount) returns (bool)',
+  'function balanceOf(address owner) view returns (uint256)',
+];
+
 // ─── PolymarketClient ─────────────────────────────────────────────────────────
 
 export class PolymarketClient {
@@ -171,7 +185,8 @@ export class PolymarketClient {
       throw new Error('POLYMARKET_PRIVATE_KEY is required for live trading');
     }
 
-    const wallet = new Wallet(POLYMARKET_PRIVATE_KEY);
+    const provider = new ethers.providers.JsonRpcProvider(POLYGON_RPC_URL);
+    const wallet = new Wallet(POLYMARKET_PRIVATE_KEY, provider);
 
     // Determine funder address:
     //   signatureType=0 (EOA):            maker === signer === wallet.address
@@ -239,6 +254,10 @@ export class PolymarketClient {
     logger.info(
       `[PolymarketClient] Initialized — funder: ${funder} | signer: ${wallet.address} | signatureType: ${sigType}`
     );
+
+    // Startup on-chain checks (non-blocking — log errors but don't abort)
+    await this.logUsdcBalance(wallet);
+    await this.ensureNegRiskAllowance(wallet);
   }
 
   /**
@@ -293,6 +312,70 @@ export class PolymarketClient {
       `  signer (operator): ${signerAddress}\n` +
       `  API key:           ${creds.key}`
     );
+  }
+
+  /**
+   * Log the wallet's on-chain USDC balance so operators can verify funds
+   * are available before the bot starts placing orders.
+   */
+  private async logUsdcBalance(wallet: Wallet): Promise<void> {
+    try {
+      const usdc = new ethers.Contract(USDC_CONTRACT_ADDRESS, ERC20_ABI, wallet.provider);
+      const raw: ethers.BigNumber = await usdc.balanceOf(wallet.address);
+      const balance = parseFloat(ethers.utils.formatUnits(raw, 6));
+      const msg = `💰 USDC balance: $${balance.toFixed(2)} (wallet: ${wallet.address})`;
+      logger.info(`[PolymarketClient] ${msg}`);
+      this.logFn?.(msg);
+    } catch (err) {
+      logger.warn(`[PolymarketClient] Could not query USDC balance: ${err}`);
+    }
+  }
+
+  /**
+   * Check the NegRisk Exchange USDC allowance and approve MaxUint256 if not set.
+   * All 5-minute crypto up/down markets route through NegRisk Exchange
+   * (0xC5d563A36AE78145C45a50134d48A1215220f80a), which requires its own allowance
+   * separate from the CTF Exchange.
+   */
+  private async ensureNegRiskAllowance(wallet: Wallet): Promise<void> {
+    try {
+      const usdc = new ethers.Contract(USDC_CONTRACT_ADDRESS, ERC20_ABI, wallet.provider);
+      const allowance: ethers.BigNumber = await usdc.allowance(wallet.address, NEGRISK_EXCHANGE_ADDRESS);
+      logger.info(
+        `[PolymarketClient] NegRisk Exchange allowance: ${ethers.utils.formatUnits(allowance, 6)} USDC`
+      );
+
+      if (allowance.gt(0)) {
+        logger.info('[PolymarketClient] ✅ NegRisk Exchange allowance already set');
+        return;
+      }
+
+      logger.info('[PolymarketClient] NegRisk Exchange allowance is 0 — approving MaxUint256...');
+      const tx = await usdc.connect(wallet).approve(
+        NEGRISK_EXCHANGE_ADDRESS,
+        ethers.constants.MaxUint256,
+        {
+          maxFeePerGas: ethers.utils.parseUnits('300', 'gwei'),
+          maxPriorityFeePerGas: ethers.utils.parseUnits('30', 'gwei'),
+        },
+      );
+      logger.info(`[PolymarketClient] Approval tx submitted: ${tx.hash}`);
+      await tx.wait();
+      logger.info('[PolymarketClient] ✅ NegRisk Exchange USDC allowance approved (MaxUint256)');
+      this.logFn?.(
+        `✅ NegRisk Exchange aprobado\n` +
+        `- Contrato: ${NEGRISK_EXCHANGE_ADDRESS}\n` +
+        `- Allowance: MaxUint256\n` +
+        `- Tx: ${tx.hash}`
+      );
+    } catch (err) {
+      logger.error(`[PolymarketClient] Failed to check/approve NegRisk allowance: ${err}`);
+      this.logFn?.(
+        `⚠️ ERROR al aprobar NegRisk Exchange\n` +
+        `- Contrato: ${NEGRISK_EXCHANGE_ADDRESS}\n` +
+        `- Detalle: ${err}`
+      );
+    }
   }
 
   private ensureClient(): ClobClient {
@@ -545,7 +628,16 @@ export class PolymarketClient {
     }
 
     try {
-      const orderArgs = {
+      // 5-minute crypto markets use the NegRisk Exchange — must flag the order accordingly
+      let isNegRiskMarket = false;
+      try {
+        isNegRiskMarket = await this.isNegRisk(tokenId);
+      } catch {
+        // non-fatal — proceed without the flag (will fall back to CTF Exchange)
+      }
+      console.log('[placeOrder] negRisk:', isNegRiskMarket);
+
+      const orderArgs: Record<string, unknown> = {
         tokenID: tokenId,
         price: effectivePrice,
         side: side === 'BUY' ? Side.BUY : Side.SELL,
@@ -554,6 +646,7 @@ export class PolymarketClient {
         nonce: '0',
         expiration: '0',
       };
+      if (isNegRiskMarket) orderArgs.negRisk = true;
 
       const signedOrder = await this.clobClient!.createOrder(orderArgs);
       console.log('[placeOrder] signed order created:', signedOrder.salt);
