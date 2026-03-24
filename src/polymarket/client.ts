@@ -20,10 +20,13 @@ import {
   Chain,
   Side,
   OrderType,
+  createL1Headers,
 } from '@polymarket/clob-client';
 import { Wallet } from 'ethers';
 import {
   POLYMARKET_PRIVATE_KEY,
+  POLYMARKET_SIGNATURE_TYPE,
+  POLYMARKET_FUNDER,
   POLYMARKET_API_KEY,
   POLYMARKET_API_SECRET,
   POLYMARKET_PASSPHRASE,
@@ -170,13 +173,25 @@ export class PolymarketClient {
 
     const wallet = new Wallet(POLYMARKET_PRIVATE_KEY);
 
-    // For signatureType=0 (EOA) maker === signer === wallet.address.
-    const funder = wallet.address;
+    // Determine funder address:
+    //   signatureType=0 (EOA):            maker === signer === wallet.address
+    //   signatureType=2 (Privy/Gmail):    funder = POLYMARKET_FUNDER (Gnosis Safe),
+    //                                     signer = wallet.address (operator key)
+    const sigType = POLYMARKET_SIGNATURE_TYPE; // 0 | 1 | 2
+    const funder = (sigType === 2 && POLYMARKET_FUNDER)
+      ? POLYMARKET_FUNDER
+      : wallet.address;
+
+    // For signatureType=2, ensure the signer is registered as an operator for the funder
+    // before attempting to derive API keys or place orders.
+    if (sigType === 2 && POLYMARKET_FUNDER) {
+      await this.ensureOperatorApproval(wallet, POLYMARKET_FUNDER);
+    }
 
     let creds: { key: string; secret: string; passphrase: string };
 
     if (POLYMARKET_API_KEY && POLYMARKET_API_SECRET && POLYMARKET_PASSPHRASE) {
-      // Use pre-derived credentials (required for Privy/Gmail accounts)
+      // Use pre-configured credentials (required for Privy/Gmail accounts)
       creds = {
         key: POLYMARKET_API_KEY,
         secret: POLYMARKET_API_SECRET,
@@ -184,20 +199,20 @@ export class PolymarketClient {
       };
       console.log('[Auth] Using pre-configured API key:', creds.key);
     } else {
-      // Derive credentials via L1 signing (works for standard EOA accounts)
+      // Derive credentials via L1 signing using the correct signatureType + funder
       const tmpClient = new ClobClient(
         CLOB_HOST,
         POLYGON_CHAIN_ID as Chain,
         wallet,
         undefined,
-        0,
+        sigType as any,
         funder,
       );
       creds = await tmpClient.deriveApiKey();
       console.log('[Auth] key:', creds.key, 'secret:', creds.secret ? 'SET' : 'MISSING');
     }
 
-    // Initialize the final client with credentials + signatureType=0 (EOA)
+    // Initialize the final client with correct signatureType and funder
     this.clobClient = new ClobClient(
       CLOB_HOST,
       POLYGON_CHAIN_ID as Chain,
@@ -207,7 +222,7 @@ export class PolymarketClient {
         secret: creds.secret,
         passphrase: creds.passphrase,
       },
-      0,
+      sigType as any,
       funder,
     );
 
@@ -215,8 +230,87 @@ export class PolymarketClient {
     this.signingAddress = wallet.address;
     this.initialized = true;
     logger.info(
-      `[PolymarketClient] Initialized — maker/signer: ${wallet.address} | signatureType: 0 (EOA)`
+      `[PolymarketClient] Initialized — funder: ${funder} | signer: ${wallet.address} | signatureType: ${sigType}`
     );
+  }
+
+  /**
+   * For signatureType=2 (Privy/Gmail accounts):
+   * Checks whether the signer wallet is already approved as an operator for the funder
+   * via GET /operators, and if not, registers it via POST /auth/api-key.
+   *
+   * The funder (0x6DCA...) is the Polymarket Gnosis Safe tied to the Gmail account and
+   * holds the internal USDC balance. The signer (wallet.address) is the operator EOA
+   * that signs orders on behalf of the funder.
+   */
+  private async ensureOperatorApproval(wallet: Wallet, funderAddress: string): Promise<void> {
+    const signerAddress = wallet.address;
+    logger.info(
+      `[PolymarketClient] signatureType=2 — funder: ${funderAddress} | signer/operator: ${signerAddress}`
+    );
+
+    // Build EIP-712 L1 authentication headers (same scheme used by the CLOB SDK)
+    const l1Headers = await createL1Headers(wallet as any, POLYGON_CHAIN_ID as Chain);
+    const fetchHeaders: Record<string, string> = {
+      'POLY_ADDRESS':   l1Headers.POLY_ADDRESS,
+      'POLY_SIGNATURE': l1Headers.POLY_SIGNATURE,
+      'POLY_TIMESTAMP': l1Headers.POLY_TIMESTAMP,
+      'POLY_NONCE':     l1Headers.POLY_NONCE,
+      'Content-Type':   'application/json',
+    };
+
+    // 1. Check whether signer is already an approved operator
+    let alreadyApproved = false;
+    try {
+      const res = await fetch(`${CLOB_HOST}/operators`, { headers: fetchHeaders });
+      if (res.ok) {
+        const data: unknown = await res.json();
+        const dataStr = JSON.stringify(data).toLowerCase();
+        alreadyApproved = dataStr.includes(signerAddress.toLowerCase());
+        logger.info(`[PolymarketClient] GET /operators response: ${JSON.stringify(data)}`);
+      } else {
+        logger.warn(`[PolymarketClient] GET /operators returned HTTP ${res.status}`);
+      }
+    } catch (err) {
+      logger.warn(`[PolymarketClient] GET /operators failed: ${err}`);
+    }
+
+    if (alreadyApproved) {
+      logger.info(`[PolymarketClient] Signer already approved as operator — skipping registration`);
+      return;
+    }
+
+    // 2. Register signer as operator by calling POST /auth/api-key via the CLOB SDK.
+    //    This creates (or re-creates) API keys for the signer acting on behalf of the funder.
+    //    NOTE: If you have stable pre-configured credentials in .env, this only runs once
+    //    on first boot and the resulting keys should be saved to POLYMARKET_API_KEY/SECRET/PASSPHRASE.
+    logger.info(
+      `[PolymarketClient] Registering ${signerAddress} as operator of ${funderAddress} via POST /auth/api-key...`
+    );
+    try {
+      const tmpClient = new ClobClient(
+        CLOB_HOST,
+        POLYGON_CHAIN_ID as Chain,
+        wallet,
+        undefined,
+        2 as any,       // SignatureType.POLY_GNOSIS_SAFE
+        funderAddress,
+      );
+      const result = await tmpClient.createApiKey();
+      logger.info(
+        `[PolymarketClient] Operator registration succeeded — new key: ${result?.key ?? '(none)'}`
+      );
+      logger.warn(
+        '[PolymarketClient] ⚠️  New API key generated. Save these credentials to .env:\n' +
+        `  POLYMARKET_API_KEY=${result?.key}\n` +
+        `  POLYMARKET_API_SECRET=${result?.secret}\n` +
+        `  POLYMARKET_PASSPHRASE=${result?.passphrase}`
+      );
+    } catch (err) {
+      // May return an error if the operator relationship already exists server-side
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn(`[PolymarketClient] POST /auth/api-key response: ${msg}`);
+    }
   }
 
   private ensureClient(): ClobClient {
