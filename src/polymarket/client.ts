@@ -449,9 +449,9 @@ export class PolymarketClient {
         price: effectivePrice,
         side: side === 'BUY' ? Side.BUY : Side.SELL,
         size: amount,
-        feeRateBps: 0,
-        nonce: 0,
-        expiration: 0,
+        feeRateBps: '1000',
+        nonce: '0',
+        expiration: '0',
       };
 
       const signedOrder = await this.clobClient!.createOrder(orderArgs);
