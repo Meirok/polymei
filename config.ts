@@ -28,7 +28,7 @@ export const POLYGON_CHAIN_ID = 137;
  *   2 = GNOSIS_SAFE / Privy-Gmail (uses internal Polymarket balance)
  */
 export const POLYMARKET_SIGNATURE_TYPE = parseInt(
-  optionalEnv('POLYMARKET_SIGNATURE_TYPE', '2'),
+  optionalEnv('POLYMARKET_SIGNATURE_TYPE', '0'),
   10,
 ) as 0 | 1 | 2;
 
