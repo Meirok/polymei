@@ -1,7 +1,3 @@
-// Using native fetch from Node 18+
-// Do NOT import fetch from 'node-fetch'
-import crypto from 'crypto';
-
 /**
  * src/polymarket/client.ts
  *
@@ -22,12 +18,13 @@ import crypto from 'crypto';
 import {
   ClobClient,
   Chain,
+  Side,
+  OrderType,
 } from '@polymarket/clob-client';
 import { Wallet } from 'ethers';
 import {
   POLYMARKET_PRIVATE_KEY,
   CLOB_HOST,
-  GAMMA_API,
   POLYGON_CHAIN_ID,
   DRY_RUN,
   SLIPPAGE_BUFFER,
@@ -168,39 +165,35 @@ export class PolymarketClient {
       throw new Error('POLYMARKET_PRIVATE_KEY is required for live trading');
     }
 
-    this.wallet = new Wallet(POLYMARKET_PRIVATE_KEY);
-    this.signingAddress = process.env.POLY_ADDRESS ?? this.wallet.address;
-    logger.info(`[PolymarketClient] Signing address: ${this.signingAddress}`);
+    const wallet = new Wallet(POLYMARKET_PRIVATE_KEY);
 
-    console.log('Using address:', process.env.POLY_ADDRESS);
-    console.log('Using API key:', process.env.POLY_API_KEY?.slice(0, 8) + '...');
-
-    // L2 credentials loaded directly from env — do NOT call deriveApiKey / createApiKey
-    const creds = {
-      key: process.env.POLY_API_KEY!,
-      secret: process.env.POLY_SECRET!,
-      passphrase: process.env.POLY_PASSPHRASE!,
-    };
-
-    console.log('[Auth] Derived creds:', {
-      key: creds.key,
-      secret: creds.secret ? creds.secret.slice(0, 8) + '...' : 'UNDEFINED',
-      passphrase: creds.passphrase ? creds.passphrase.slice(0, 8) + '...' : 'UNDEFINED',
-    });
-
-    // Pass POLY_ADDRESS as grantedAuth so ClobClient uses the correct account,
-    // not the address derived from the private key.
+    // Initialize without credentials first so we can derive them
     this.clobClient = new ClobClient(
       CLOB_HOST,
       POLYGON_CHAIN_ID as Chain,
-      this.wallet,
-      creds,
-      undefined,                      // sigType — use SDK default
-      process.env.POLY_ADDRESS,       // grantedAuth — the funded account address
+      wallet,
     );
 
+    // Derive L2 credentials from the wallet private key
+    const creds = await this.clobClient.deriveApiKey();
+    console.log('[Auth] key:', creds.key, 'secret:', creds.secret ? 'SET' : 'MISSING');
+
+    // Re-initialize with derived credentials
+    this.clobClient = new ClobClient(
+      CLOB_HOST,
+      POLYGON_CHAIN_ID as Chain,
+      wallet,
+      {
+        key: creds.key,
+        secret: creds.secret,
+        passphrase: creds.passphrase,
+      },
+    );
+
+    this.wallet = wallet;
+    this.signingAddress = wallet.address;
     this.initialized = true;
-    logger.info('[PolymarketClient] Initialized');
+    logger.info(`[PolymarketClient] Initialized — address: ${wallet.address}`);
   }
 
   private ensureClient(): ClobClient {
@@ -429,13 +422,11 @@ export class PolymarketClient {
   // ─── Order Placement ────────────────────────────────────────────────────────
 
   /**
-   * Place a limit order via direct HTTP + EIP-712 signing (no SDK).
+   * Place a limit order via the @polymarket/clob-client SDK.
    * sizeUsd is the dollar amount to spend; converted to shares via price.
    */
   async placeOrder(params: PlaceOrderParams): Promise<OrderResult> {
     if (!params.tokenId) throw new Error('tokenId is undefined');
-    if (!process.env.POLY_SECRET) throw new Error('API secret is undefined');
-    if (!process.env.POLY_PASSPHRASE) throw new Error('passphrase is undefined');
 
     const { tokenId, side, price, sizeUsd, marketId } = params;
 
@@ -453,119 +444,31 @@ export class PolymarketClient {
     }
 
     try {
-      const wallet = new Wallet(process.env.POLYMARKET_PRIVATE_KEY!);
-
-      // Build order
-      const salt = Math.floor(Math.random() * 1e12);
-      const makerAmount = side === 'BUY'
-        ? Math.round(amount * effectivePrice * 1e6)   // USDC spent
-        : Math.round(amount * 1e6);                   // shares sold
-      const takerAmount = side === 'BUY'
-        ? Math.round(amount * 1e6)                    // shares received
-        : Math.round(amount * effectivePrice * 1e6);  // USDC received
-
-      const order = {
-        salt,
-        maker: wallet.address,
-        signer: wallet.address,
-        taker: '0x0000000000000000000000000000000000000000',
-        tokenId,
-        makerAmount: makerAmount.toString(),
-        takerAmount: takerAmount.toString(),
-        side: side === 'BUY' ? 'BUY' : 'SELL',
-        expiration: '0',
-        nonce: '0',
-        feeRateBps: '0',
-        signatureType: 0,
+      const orderArgs = {
+        tokenID: tokenId,
+        price: effectivePrice,
+        side: side === 'BUY' ? Side.BUY : Side.SELL,
+        size: amount,
+        feeRateBps: 0,
+        nonce: 0,
+        expiration: 0,
       };
 
-      // Sign order with EIP-712
-      const domain = {
-        name: 'CTFExchange',
-        version: '1',
-        chainId: 137,
-        verifyingContract: '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E',
-      };
-      const types = {
-        Order: [
-          { name: 'salt', type: 'uint256' },
-          { name: 'maker', type: 'address' },
-          { name: 'signer', type: 'address' },
-          { name: 'taker', type: 'address' },
-          { name: 'tokenId', type: 'uint256' },
-          { name: 'makerAmount', type: 'uint256' },
-          { name: 'takerAmount', type: 'uint256' },
-          { name: 'expiration', type: 'uint256' },
-          { name: 'nonce', type: 'uint256' },
-          { name: 'feeRateBps', type: 'uint256' },
-          { name: 'side', type: 'uint8' },
-          { name: 'signatureType', type: 'uint8' },
-        ],
-      };
-      const orderValues = {
-        salt: salt.toString(),
-        maker: wallet.address,
-        signer: wallet.address,
-        taker: '0x0000000000000000000000000000000000000000',
-        tokenId: tokenId,
-        makerAmount: makerAmount.toString(),
-        takerAmount: takerAmount.toString(),
-        expiration: '0',
-        nonce: '0',
-        feeRateBps: '0',
-        side: side === 'BUY' ? 0 : 1,
-        signatureType: 0,
-      };
+      const signedOrder = await this.clobClient!.createOrder(orderArgs);
+      console.log('[placeOrder] signed order created:', signedOrder.salt);
 
-      const signature = await wallet._signTypedData(domain, types, orderValues);
+      const result = await this.clobClient!.postOrder(signedOrder, OrderType.GTC);
+      console.log('[placeOrder] post result:', JSON.stringify(result));
 
-      // Build request body first (needed for HMAC)
-      const requestBody = JSON.stringify({
-        order: { ...order, signature },
-        owner: process.env.POLY_API_KEY!,
-        orderType: 'GTC',
-        deferExec: false,
-      });
-
-      // Build HMAC auth header
-      const timestamp = Math.floor(Date.now() / 1000).toString();
-      const message = timestamp + 'POST' + '/order' + requestBody;
-      const rawSecret = process.env.POLY_SECRET!.replace(/-/g, '+').replace(/_/g, '/');
-      const paddedSecret = rawSecret.padEnd(rawSecret.length + (4 - rawSecret.length % 4) % 4, '=');
-      const hmacSecret = Buffer.from(paddedSecret, 'base64');
-      const hmac = crypto.createHmac('sha256', hmacSecret)
-        .update(message)
-        .digest('base64');
-
-      console.log('[placeOrder] HMAC message:', message);
-      console.log('[placeOrder] HMAC signature:', hmac);
-
-      // Submit order
-      const response = await fetch('https://clob.polymarket.com/order', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'POLY_ADDRESS': wallet.address,
-          'POLY_SIGNATURE': hmac,
-          'POLY_TIMESTAMP': timestamp,
-          'POLY_API_KEY': process.env.POLY_API_KEY!,
-          'POLY_PASSPHRASE': process.env.POLY_PASSPHRASE!,
-        },
-        body: requestBody,
-      });
-
-      const result = await response.json() as any;
-      console.log('[placeOrder] response:', JSON.stringify(result));
-
-      if (!response.ok) {
-        const errMsg = result.error || JSON.stringify(result);
+      if (!result || result.errorCode) {
+        const errMsg = result?.error || result?.errorCode || JSON.stringify(result);
         this.logFn?.(
           `⚠️ ERROR: polymarket\n` +
           `- Módulo: polymarket\n` +
           `- Detalle: Order rejected — ${errMsg}\n` +
           `- Acción: skipping trade`
         );
-        return { success: false, price: effectivePrice, sizeShares: amount, errorMsg: errMsg };
+        return { success: false, price: effectivePrice, sizeShares: amount, errorMsg: String(errMsg) };
       }
 
       return {
@@ -608,16 +511,6 @@ export class PolymarketClient {
   }
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
-
-  private getCredentials() {
-    const key = process.env.POLY_API_KEY
-    const secret = process.env.POLY_SECRET
-    const passphrase = process.env.POLY_PASSPHRASE
-    if (!key || !secret || !passphrase) {
-      throw new Error(`Missing credentials in .env — key:${!!key} secret:${!!secret} passphrase:${!!passphrase}`)
-    }
-    return { key, secret, passphrase }
-  }
 
   private async getTickSize(tokenId: string): Promise<string> {
     if (this.tickSizeCache.has(tokenId)) return this.tickSizeCache.get(tokenId)!;
