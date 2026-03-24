@@ -503,18 +503,21 @@ export class PolymarketClient {
         ],
       };
       const orderValues = {
-        ...order,
-        salt: BigInt(salt),
-        makerAmount: BigInt(makerAmount),
-        takerAmount: BigInt(takerAmount),
-        expiration: BigInt(0),
-        nonce: BigInt(0),
-        feeRateBps: BigInt(0),
+        salt: salt.toString(),
+        maker: wallet.address,
+        signer: wallet.address,
+        taker: '0x0000000000000000000000000000000000000000',
+        tokenId: tokenId,
+        makerAmount: makerAmount.toString(),
+        takerAmount: takerAmount.toString(),
+        expiration: '0',
+        nonce: '0',
+        feeRateBps: '0',
         side: side === 'BUY' ? 0 : 1,
         signatureType: 0,
       };
 
-      const signature = await wallet.signTypedData(domain, types, orderValues);
+      const signature = await wallet._signTypedData(domain, types, orderValues);
 
       // Build HMAC auth header
       const timestamp = Math.floor(Date.now() / 1000).toString();
