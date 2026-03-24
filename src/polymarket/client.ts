@@ -519,16 +519,26 @@ export class PolymarketClient {
 
       const signature = await wallet._signTypedData(domain, types, orderValues);
 
+      // Build request body first (needed for HMAC)
+      const requestBody = JSON.stringify({
+        order: { ...order, signature },
+        owner: process.env.POLY_API_KEY!,
+        orderType: 'GTC',
+        deferExec: false,
+      });
+
       // Build HMAC auth header
       const timestamp = Math.floor(Date.now() / 1000).toString();
-      const message = timestamp + 'POST' + '/order';
-      const hmacSecret = Buffer.from(
-        process.env.POLY_SECRET!.replace(/-/g, '+').replace(/_/g, '/'),
-        'base64'
-      );
+      const message = timestamp + 'POST' + '/order' + requestBody;
+      const rawSecret = process.env.POLY_SECRET!.replace(/-/g, '+').replace(/_/g, '/');
+      const paddedSecret = rawSecret.padEnd(rawSecret.length + (4 - rawSecret.length % 4) % 4, '=');
+      const hmacSecret = Buffer.from(paddedSecret, 'base64');
       const hmac = crypto.createHmac('sha256', hmacSecret)
         .update(message)
-        .digest('base64url');
+        .digest('base64');
+
+      console.log('[placeOrder] HMAC message:', message);
+      console.log('[placeOrder] HMAC signature:', hmac);
 
       // Submit order
       const response = await fetch('https://clob.polymarket.com/order', {
@@ -541,12 +551,7 @@ export class PolymarketClient {
           'POLY_API_KEY': process.env.POLY_API_KEY!,
           'POLY_PASSPHRASE': process.env.POLY_PASSPHRASE!,
         },
-        body: JSON.stringify({
-          order: { ...order, signature },
-          owner: process.env.POLY_API_KEY!,
-          orderType: 'GTC',
-          deferExec: false,
-        }),
+        body: requestBody,
       });
 
       const result = await response.json() as any;
