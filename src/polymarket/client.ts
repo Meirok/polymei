@@ -1,5 +1,6 @@
 // Using native fetch from Node 18+
 // Do NOT import fetch from 'node-fetch'
+import crypto from 'crypto';
 
 /**
  * src/polymarket/client.ts
@@ -20,8 +21,6 @@
 
 import {
   ClobClient,
-  Side as ClobSide,
-  OrderType as ClobOrderType,
   Chain,
 } from '@polymarket/clob-client';
 import { Wallet } from 'ethers';
@@ -430,88 +429,142 @@ export class PolymarketClient {
   // ─── Order Placement ────────────────────────────────────────────────────────
 
   /**
-   * Place a limit order. In DRY_RUN mode, simulates the order.
+   * Place a limit order via direct HTTP + EIP-712 signing (no SDK).
    * sizeUsd is the dollar amount to spend; converted to shares via price.
    */
   async placeOrder(params: PlaceOrderParams): Promise<OrderResult> {
-    console.log('[placeOrder] params:', {
-      tokenId: params.tokenId,
-      side: params.side,
-      amount: params.sizeUsd,
-      price: params.price,
-      tokenIdType: typeof params.tokenId,
-    });
-    console.log('[placeOrder] creds:', {
-      key: this.clobClient ? 'SET' : 'UNDEFINED',
-      secret: (this.clobClient as any)?._creds?.secret ? 'SET' : 'UNDEFINED',
-      passphrase: (this.clobClient as any)?._creds?.passphrase ? 'SET' : 'UNDEFINED',
-    });
-
     if (!params.tokenId) throw new Error('tokenId is undefined');
     if (!process.env.POLY_SECRET) throw new Error('API secret is undefined');
     if (!process.env.POLY_PASSPHRASE) throw new Error('passphrase is undefined');
 
     const { tokenId, side, price, sizeUsd, marketId } = params;
 
-    // Convert dollar amount to shares
+    // Convert dollar amount to shares; enforce minimum 5 shares
     const sizeShares = Math.floor(sizeUsd / price);
-    // Minimum 5 shares, minimum $1 value
-    const effectiveSize = Math.max(sizeShares, 5);
+    const amount = Math.max(sizeShares, 5);
     const effectivePrice = Math.min(Math.max(price + SLIPPAGE_BUFFER, 0.01), 0.99);
+
+    console.log('[placeOrder] params:', { tokenId, side, amount, price: effectivePrice });
 
     if (DRY_RUN) {
       const fakeId = `dry-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      logger.info(
-        `[DRY RUN] ${side} ${effectiveSize} shares @ ${effectivePrice} on ${marketId}`
-      );
-      return {
-        success: true,
-        orderId: fakeId,
-        price: effectivePrice,
-        sizeShares: effectiveSize,
-      };
+      logger.info(`[DRY RUN] ${side} ${amount} shares @ ${effectivePrice} on ${marketId}`);
+      return { success: true, orderId: fakeId, price: effectivePrice, sizeShares: amount };
     }
 
-    const client = this.ensureClient();
-
     try {
-      const [tickSize, negRisk] = await Promise.all([
-        this.getTickSize(tokenId),
-        this.isNegRisk(tokenId),
-      ]);
+      const wallet = new Wallet(process.env.POLYMARKET_PRIVATE_KEY!);
 
-      const result = await client.createAndPostOrder(
-        {
-          tokenID: tokenId,
-          side: side === 'BUY' ? ClobSide.BUY : ClobSide.SELL,
-          price: effectivePrice,
-          size: effectiveSize,
-          expiration: 0,
-        },
-        { tickSize: tickSize as any, negRisk },
-        ClobOrderType.GTC
+      // Build order
+      const salt = Math.floor(Math.random() * 1e12);
+      const makerAmount = side === 'BUY'
+        ? Math.round(amount * effectivePrice * 1e6)   // USDC spent
+        : Math.round(amount * 1e6);                   // shares sold
+      const takerAmount = side === 'BUY'
+        ? Math.round(amount * 1e6)                    // shares received
+        : Math.round(amount * effectivePrice * 1e6);  // USDC received
+
+      const order = {
+        salt,
+        maker: wallet.address,
+        signer: wallet.address,
+        taker: '0x0000000000000000000000000000000000000000',
+        tokenId,
+        makerAmount: makerAmount.toString(),
+        takerAmount: takerAmount.toString(),
+        side: side === 'BUY' ? 'BUY' : 'SELL',
+        expiration: '0',
+        nonce: '0',
+        feeRateBps: '0',
+        signatureType: 0,
+      };
+
+      // Sign order with EIP-712
+      const domain = {
+        name: 'CTFExchange',
+        version: '1',
+        chainId: 137,
+        verifyingContract: '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E',
+      };
+      const types = {
+        Order: [
+          { name: 'salt', type: 'uint256' },
+          { name: 'maker', type: 'address' },
+          { name: 'signer', type: 'address' },
+          { name: 'taker', type: 'address' },
+          { name: 'tokenId', type: 'uint256' },
+          { name: 'makerAmount', type: 'uint256' },
+          { name: 'takerAmount', type: 'uint256' },
+          { name: 'expiration', type: 'uint256' },
+          { name: 'nonce', type: 'uint256' },
+          { name: 'feeRateBps', type: 'uint256' },
+          { name: 'side', type: 'uint8' },
+          { name: 'signatureType', type: 'uint8' },
+        ],
+      };
+      const orderValues = {
+        ...order,
+        salt: BigInt(salt),
+        makerAmount: BigInt(makerAmount),
+        takerAmount: BigInt(takerAmount),
+        expiration: BigInt(0),
+        nonce: BigInt(0),
+        feeRateBps: BigInt(0),
+        side: side === 'BUY' ? 0 : 1,
+        signatureType: 0,
+      };
+
+      const signature = await wallet.signTypedData(domain, types, orderValues);
+
+      // Build HMAC auth header
+      const timestamp = Math.floor(Date.now() / 1000).toString();
+      const message = timestamp + 'POST' + '/order';
+      const hmacSecret = Buffer.from(
+        process.env.POLY_SECRET!.replace(/-/g, '+').replace(/_/g, '/'),
+        'base64'
       );
+      const hmac = crypto.createHmac('sha256', hmacSecret)
+        .update(message)
+        .digest('base64url');
 
-      const success =
-        result.success === true ||
-        (result.orderID !== undefined && result.orderID !== '');
+      // Submit order
+      const response = await fetch('https://clob.polymarket.com/order', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'POLY_ADDRESS': wallet.address,
+          'POLY_SIGNATURE': hmac,
+          'POLY_TIMESTAMP': timestamp,
+          'POLY_API_KEY': process.env.POLY_API_KEY!,
+          'POLY_PASSPHRASE': process.env.POLY_PASSPHRASE!,
+        },
+        body: JSON.stringify({
+          order: { ...order, signature },
+          owner: process.env.POLY_API_KEY!,
+          orderType: 'GTC',
+          deferExec: false,
+        }),
+      });
 
-      if (!success) {
-        const errMsg = result.errorMsg ?? 'unknown error';
+      const result = await response.json() as any;
+      console.log('[placeOrder] response:', JSON.stringify(result));
+
+      if (!response.ok) {
+        const errMsg = result.error || JSON.stringify(result);
         this.logFn?.(
           `⚠️ ERROR: polymarket\n` +
           `- Módulo: polymarket\n` +
           `- Detalle: Order rejected — ${errMsg}\n` +
           `- Acción: skipping trade`
         );
+        return { success: false, price: effectivePrice, sizeShares: amount, errorMsg: errMsg };
       }
 
       return {
-        success,
-        orderId: result.orderID,
+        success: true,
+        orderId: result.orderID || result.id,
         price: effectivePrice,
-        sizeShares: effectiveSize,
-        errorMsg: success ? undefined : result.errorMsg,
+        sizeShares: amount,
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -522,7 +575,7 @@ export class PolymarketClient {
         `- Detalle: placeOrder failed — ${msg}\n` +
         `- Acción: skipping trade`
       );
-      return { success: false, price: effectivePrice, sizeShares: effectiveSize, errorMsg: msg };
+      return { success: false, price: effectivePrice, sizeShares: amount, errorMsg: msg };
     }
   }
 
