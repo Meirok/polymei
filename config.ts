@@ -21,6 +21,25 @@ export const CLOB_HOST = 'https://clob.polymarket.com';
 export const GAMMA_API = 'https://gamma-api.polymarket.com';
 export const POLYGON_CHAIN_ID = 137;
 
+/**
+ * Signature type for order signing:
+ *   0 = EOA (standard wallet, requires on-chain USDC)
+ *   1 = POLY_PROXY / Magic Link
+ *   2 = GNOSIS_SAFE / Privy-Gmail (uses internal Polymarket balance)
+ */
+export const POLYMARKET_SIGNATURE_TYPE = parseInt(
+  optionalEnv('POLYMARKET_SIGNATURE_TYPE', '2'),
+  10,
+) as 0 | 1 | 2;
+
+/** Funder address — wallet that holds the internal balance (for signatureType 2) */
+export const POLYMARKET_FUNDER = optionalEnv('POLYMARKET_FUNDER', '');
+
+/** Pre-derived L2 API credentials (skip deriveApiKey() call when set) */
+export const POLYMARKET_API_KEY    = optionalEnv('POLYMARKET_API_KEY', '');
+export const POLYMARKET_API_SECRET = optionalEnv('POLYMARKET_API_SECRET', '');
+export const POLYMARKET_PASSPHRASE = optionalEnv('POLYMARKET_PASSPHRASE', '');
+
 // ─── Binance ─────────────────────────────────────────────────────────────────
 export const BINANCE_WS_URL = optionalEnv(
   'BINANCE_WS_URL',

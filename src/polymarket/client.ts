@@ -24,6 +24,11 @@ import {
 import { Wallet } from 'ethers';
 import {
   POLYMARKET_PRIVATE_KEY,
+  POLYMARKET_SIGNATURE_TYPE,
+  POLYMARKET_FUNDER,
+  POLYMARKET_API_KEY,
+  POLYMARKET_API_SECRET,
+  POLYMARKET_PASSPHRASE,
   CLOB_HOST,
   POLYGON_CHAIN_ID,
   DRY_RUN,
@@ -168,18 +173,36 @@ export class PolymarketClient {
 
     const wallet = new Wallet(POLYMARKET_PRIVATE_KEY);
 
-    // Initialize without credentials first so we can derive them
-    this.clobClient = new ClobClient(
-      CLOB_HOST,
-      POLYGON_CHAIN_ID as Chain,
-      wallet,
-    );
+    // Funder address: use env var if set, otherwise fall back to wallet address.
+    // For signatureType=2 (Privy/Gnosis Safe) the funder is the account address
+    // that holds the internal Polymarket balance.
+    const funder = POLYMARKET_FUNDER || wallet.address;
 
-    // Derive L2 credentials from the wallet private key
-    const creds = await this.clobClient.deriveApiKey();
-    console.log('[Auth] key:', creds.key, 'secret:', creds.secret ? 'SET' : 'MISSING');
+    let creds: { key: string; secret: string; passphrase: string };
 
-    // Re-initialize with derived credentials
+    if (POLYMARKET_API_KEY && POLYMARKET_API_SECRET && POLYMARKET_PASSPHRASE) {
+      // Use pre-derived credentials (required for Privy/Gmail accounts)
+      creds = {
+        key: POLYMARKET_API_KEY,
+        secret: POLYMARKET_API_SECRET,
+        passphrase: POLYMARKET_PASSPHRASE,
+      };
+      console.log('[Auth] Using pre-configured API key:', creds.key);
+    } else {
+      // Derive credentials via L1 signing (works for standard EOA accounts)
+      const tmpClient = new ClobClient(
+        CLOB_HOST,
+        POLYGON_CHAIN_ID as Chain,
+        wallet,
+        undefined,
+        POLYMARKET_SIGNATURE_TYPE,
+        funder,
+      );
+      creds = await tmpClient.deriveApiKey();
+      console.log('[Auth] key:', creds.key, 'secret:', creds.secret ? 'SET' : 'MISSING');
+    }
+
+    // Initialize the final client with credentials + correct signature type
     this.clobClient = new ClobClient(
       CLOB_HOST,
       POLYGON_CHAIN_ID as Chain,
@@ -189,12 +212,16 @@ export class PolymarketClient {
         secret: creds.secret,
         passphrase: creds.passphrase,
       },
+      POLYMARKET_SIGNATURE_TYPE,
+      funder,
     );
 
     this.wallet = wallet;
-    this.signingAddress = wallet.address;
+    this.signingAddress = funder;
     this.initialized = true;
-    logger.info(`[PolymarketClient] Initialized — address: ${wallet.address}`);
+    logger.info(
+      `[PolymarketClient] Initialized — signer: ${wallet.address} | funder: ${funder} | signatureType: ${POLYMARKET_SIGNATURE_TYPE}`
+    );
   }
 
   private ensureClient(): ClobClient {
